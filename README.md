@@ -264,13 +264,15 @@ Wall time per operation:
 
 | Workload | caduceus | pgx v5.10 | database/sql + pgx | database/sql + lib/pq |
 | :--- | ---: | ---: | ---: | ---: |
-| QueryRow, one int8 parameter | **47.5 µs** | 64.2 µs | 69.8 µs | 112 µs |
-| 100 rows × 4 typed columns | **146 µs** | 229 µs | 217 µs | 307 µs |
-| BEGIN, INSERT, COMMIT | **147 µs** | 211 µs | 222 µs | 274 µs |
-| Batch of 10 selects | **76.3 µs** | 107 µs | 693 µs ¹ | 1.13 ms ¹ |
-| COPY 1,000 rows | **1.84 ms** | 2.13 ms | — ² | 2.54 ms ³ |
-| 1,000 inserts in one transaction | **3.09 ms** ⁴ | 4.76 ms ⁴ | 68 ms | 54 ms |
-| Decode a pgoutput UPDATE | **1.06 µs** | 1.86 µs (pglogrepl) | — | — |
+| QueryRow, one int8 parameter | **49.2 µs** | 65.3 µs | 67.6 µs | 108 µs |
+| QueryRow, nothing kept on the server ⁵ | **65.0 µs** | 80.2 µs | — | — |
+| 100 rows × 4 typed columns | **171 µs** | 260 µs | 249 µs | 350 µs |
+| BEGIN, INSERT, COMMIT | **122 µs** | 232 µs | 270 µs | 286 µs |
+| BEGIN, batch of 10 inserts, COMMIT | **158 µs** | 264 µs | 910 µs ¹ | 1.33 ms ¹ |
+| Batch of 10 selects | **79.4 µs** | 110 µs | 728 µs ¹ | 1.15 ms ¹ |
+| COPY 1,000 rows | **1.96 ms** | 2.32 ms | — ² | 3.06 ms ³ |
+| 1,000 inserts in one transaction | **3.05 ms** ⁴ | 4.80 ms ⁴ | 79 ms | 54 ms |
+| Decode a pgoutput UPDATE | **1.0 µs** | 1.8 µs (pglogrepl) | — | — |
 
 Wall time includes the server's share of every round trip, which no driver can
 change. Client CPU per operation is the driver's own (`cpu-ns/op` in the
@@ -278,46 +280,54 @@ benchmark output, the process's user and system time):
 
 | Workload | caduceus | pgx v5.10 | database/sql + pgx | database/sql + lib/pq |
 | :--- | ---: | ---: | ---: | ---: |
-| QueryRow | **30.4 µs** | 53.7 µs | 60.0 µs | 69.4 µs |
-| 100 rows × 4 typed columns | **64.6 µs** | 152 µs | 138 µs | 186 µs |
-| BEGIN, INSERT, COMMIT | **90.4 µs** | 165 µs | 197 µs | 209 µs |
-| Batch of 10 selects | **41.6 µs** | 84.5 µs | 591 µs | 700 µs |
-| COPY 1,000 rows | **236 µs** | 622 µs | — | 1.01 ms |
-| 1,000 inserts in one transaction | **588 µs** | 2.63 ms | 55 ms | 34 ms |
+| QueryRow | **31.0 µs** | 55.1 µs | 57.6 µs | 68.3 µs |
+| QueryRow, nothing kept on the server | **36.0 µs** | 58.2 µs | — | — |
+| 100 rows × 4 typed columns | **73.2 µs** | 168 µs | 153 µs | 203 µs |
+| BEGIN, INSERT, COMMIT | **70.2 µs** | 182 µs | 227 µs | 219 µs |
+| BEGIN, batch of 10 inserts, COMMIT | **76.6 µs** | 192 µs | 758 µs | 843 µs |
+| Batch of 10 selects | **42.3 µs** | 87.1 µs | 622 µs | 723 µs |
+| COPY 1,000 rows | **266 µs** | 650 µs | — | 1.19 ms |
+| 1,000 inserts in one transaction | **544 µs** | 2.62 ms | 65 ms | 35 ms |
 
 Memory allocated per operation:
 
 | Workload | caduceus | pgx v5.10 | database/sql + pgx | database/sql + lib/pq |
 | :--- | ---: | ---: | ---: | ---: |
 | QueryRow | **263 B** · 1 alloc | 351 B · 5 | 759 B · 15 | 703 B · 17 |
+| QueryRow, nothing kept on the server | **263 B** · 1 | 359 B · 6 | — | — |
 | 100 rows × 4 typed columns | **1.9 KiB** · 105 | 11 KiB · 662 | 8.2 KiB · 525 | 12 KiB · 623 |
-| BEGIN, INSERT, COMMIT | **95 B** · 5 | 192 B · 6 | 725 B · 16 | 767 B · 17 |
-| Batch of 10 selects | **2.7 KiB** · 12 | 6.7 KiB · 161 | 7.3 KiB · 140 | 6.7 KiB · 160 |
-| COPY 1,000 rows | **0.7 KiB** · 22 | 114 KiB · 43 | — | 222 KiB · 4,027 |
-| 1,000 inserts in one transaction | **33 KiB** · 12 | 809 KiB · 9,037 | 252 KiB · 6,033 | 204 KiB · 7,014 |
+| BEGIN, INSERT, COMMIT | **55 B** · 1 | 192 B · 6 | 724 B · 16 | 767 B · 17 |
+| BEGIN, batch of 10 inserts, COMMIT | **440 B** · 4 | 6.2 KiB · 116 | 2.9 KiB · 70 | 4.0 KiB · 98 |
+| Batch of 10 selects | **2.6 KiB** · 12 | 6.7 KiB · 161 | 7.3 KiB · 140 | 6.7 KiB · 160 |
+| COPY 1,000 rows | **720 B** · 21 | 115 KiB · 43 | — | 221 KiB · 4,027 |
+| 1,000 inserts in one transaction | **536 B** · 8 | 809 KiB · 9,037 | 252 KiB · 6,033 | 204 KiB · 7,014 |
 
 ¹ database/sql has no batch, so the ten queries run one after another.
 ² pgx's database/sql driver has no COPY.
 ³ lib/pq's `CopyIn`, which needs a transaction around it.
 ⁴ `tx.SendPipeline` for caduceus, `SendBatch` for pgx.
+⁵ The statement cache off, as behind a pooler in transaction mode: one round
+trip, its description remembered on the client. pgx's fastest such mode,
+`QueryExecModeCacheDescribe`, is the one shown; `QueryExecModeExec` takes
+83.0 µs, and caduceus remembering nothing, asking every time, 120 µs.
 
 ### A million rows
 
 Each cell is wall time · client CPU · memory allocated, for one pass over a
 million rows: reading four typed columns, copying two columns in, and inserting
-two columns with a statement per row in one transaction. Medians of three to
-seven passes on the same machine.
+two columns with a statement per row in one transaction. Means of five passes
+on the same machine.
 
 | Workload | caduceus | pgx v5.10 | database/sql + pgx | lib/pq |
 | :--- | ---: | ---: | ---: | ---: |
-| Read 1M rows | 594 ms · **292 ms** · **15 MiB** | 679 ms · 641 ms · 106 MiB | 557 ms · 529 ms · 86 MiB | 789 ms · 790 ms · 125 MiB |
-| COPY 1M rows | **214 ms** · **53 ms** · **0.7 KiB** | 240 ms · 116 ms · 305 KiB | — | 317 ms · 430 ms · 153 MiB ³ |
-| 1M inserts in one transaction | **2.68 s** · **0.44 s** · **30 MiB** ⁴ | 3.65 s · 2.26 s · 932 MiB ⁴ | 69.7 s · 57.9 s · 244 MiB | 47.1 s · 28.9 s · 206 MiB |
+| Read 1M rows | **559 ms** · **273 ms** · **15 MiB** | 646 ms · 627 ms · 106 MiB | 654 ms · 586 ms · 86 MiB | 818 ms · 808 ms · 125 MiB |
+| COPY 1M rows | **216 ms** · **46 ms** · **57 KiB** | 263 ms · 114 ms · 319 KiB | — | 354 ms · 437 ms · 153 MiB ³ |
+| 1M inserts in one transaction | **2.56 s** · **0.48 s** · **70 KiB** ⁴ | 3.74 s · 2.27 s · 932 MiB ⁴ | 71.3 s · 59.1 s · 244 MiB | 54.2 s · 35.4 s · 206 MiB |
 
 Reading and copying a million rows take as long as the server takes to produce
 or store them: a client that discards the rows of that read without decoding
-them is no faster, at 620 to 690 ms. On wall time the three fastest are within
-the noise of one another there. What a driver decides is what the client spends
+them is no faster, at 620 to 690 ms. On wall time the three fastest are close
+there. What a driver decides is what the client spends
 on its side, and caduceus spends about half the CPU of the next and a fraction
 of the memory.
 
