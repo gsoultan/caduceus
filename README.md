@@ -221,6 +221,11 @@ Profiled, about 80% of caduceus's client CPU on a single query is the kernel's
 `write` and `read` and the Go runtime waking for them; the driver's own code,
 decoding included, is under a fifth.
 
+On disk, a program that connects and runs one query builds to 5.2 MiB with
+caduceus, against 8.8 MiB with pgx, 8.9 MiB with database/sql over pgx and
+5.3 MiB with database/sql over lib/pq (linux/amd64, `CGO_ENABLED=0`,
+`-trimpath -ldflags='-s -w'`).
+
 Reproduce with:
 
 ```bash
