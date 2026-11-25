@@ -30,6 +30,10 @@ type TxOptions struct {
 // against the known ones, since it is written into the statement rather than
 // bound.
 func (o TxOptions) beginSQL() (string, error) {
+	if o == (TxOptions{}) {
+		// The usual transaction, and one string built the fewer for it.
+		return "BEGIN", nil
+	}
 	var b strings.Builder
 	b.WriteString("BEGIN")
 	switch o.IsoLevel {

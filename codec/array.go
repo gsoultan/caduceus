@@ -102,7 +102,7 @@ func nest(values []any, dims []int) any {
 func scanArray(oid uint32, format int16, src []byte, value reflect.Value) error {
 	element, known := arrayElements[oid]
 	if !known || format != 1 {
-		return fmt.Errorf("caduceus/codec: cannot scan type %d into %s", oid, value.Type())
+		return errFormat(oid, value.Type().String())
 	}
 	array, err := parseArray(src)
 	if err != nil {
@@ -155,7 +155,7 @@ func arrayText(oid uint32, src []byte) (string, error) {
 			texts[i] = "NULL"
 			continue
 		}
-		text, err := asString(arrayElements[oid], elementFormat, raw)
+		text, err := printedElement(arrayElements[oid], raw)
 		if err != nil {
 			return "", err
 		}
@@ -164,6 +164,15 @@ func arrayText(oid uint32, src []byte) (string, error) {
 	var b strings.Builder
 	writeNested(&b, texts, array.dims)
 	return b.String(), nil
+}
+
+// printedElement is the text array_out prints for an element. A bytea's is
+// its hex form, where a bytea column read as a string is its bytes.
+func printedElement(element uint32, raw []byte) (string, error) {
+	if element == Bytea {
+		return `\x` + hexString(raw), nil
+	}
+	return asString(element, elementFormat, raw)
 }
 
 func writeNested(b *strings.Builder, texts []string, dims []int) {

@@ -47,6 +47,17 @@ type Config struct {
 	// MaxMessageSize bounds a single message from the server. Zero means
 	// DefaultMaxMessageSize.
 	MaxMessageSize int
+
+	// NoStreamWatermark leaves the socket's receive low-water mark alone.
+	// By default, on Linux over TCP, it is raised to 64 KiB once a result has
+	// run past 4 MiB, which wakes the reader an eighth as often; the end of
+	// such a result is then delivered about 2 ms late, or later where the
+	// machine is too busy to run the timer that lowers the mark on time. The
+	// kernel is asked whether it wakes a reader when the mark is lowered by
+	// its version, so a system that emulates Linux and reports a Linux
+	// version, such as gVisor or WSL 1, is taken at its word: set this there
+	// if long results stall at their end.
+	NoStreamWatermark bool
 }
 
 // Copy returns a deep copy, safe to adjust for one connection without
@@ -72,6 +83,11 @@ func (c *Config) target() (string, string) {
 		return "unix", c.Host + "/.s.PGSQL." + port
 	}
 	return "tcp", net.JoinHostPort(c.Host, port)
+}
+
+// noWatermark reports whether the low-water mark is to be left alone.
+func (c *Config) noWatermark() bool {
+	return c == nil || c.NoStreamWatermark
 }
 
 func (c *Config) maxMessage() int {

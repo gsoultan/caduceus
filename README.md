@@ -28,7 +28,7 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **COPY** | `CopyFrom` streams rows in 64 KiB chunks, in binary where the column types allow it |
 | **LISTEN/NOTIFY** | `WaitForNotification`, which never aborts a connection on timeout |
 | **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection |
-| **Statement cache** | LRU of server-side prepared statements, 64 by default; disable it for a pooler in transaction mode |
+| **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
 | **Types** | integers, floats, numeric, bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, arrays; `codec.Scanner` and `codec.Valuer` for your own types; a pointer destination receives NULL |
 | **Errors** | `*wire.Error` with the SQLSTATE and every field the server sends; classify by `SQLState()`, never by message text |
 | **Logical replication** | package `replication`: pgoutput v1 decoder, XLogData, keepalives, standby status, LSNs |
@@ -64,6 +64,57 @@ return tx.Commit(ctx) // ErrTxCommitRollback if the server rolled it back instea
 `BeginTx(ctx, caduceus.TxOptions{IsoLevel: caduceus.Serializable, ReadOnly: true})`
 sets the characteristics. Only the declared isolation levels are accepted, since
 the level is written into `BEGIN` rather than bound.
+
+`Begin` sends nothing. `BEGIN` travels in front of the transaction's first
+statement, in the same write, so a transaction takes one round trip fewer:
+two for `BEGIN`, one statement and `COMMIT`, where three were sent. A
+transaction that runs no statement sends nothing at all. The first statement
+can be a batch or a copy as well: `BEGIN` goes in front of the batch, or of
+whatever has to be described first. Only a pipeline of statements the
+connection already knows sends `BEGIN` by itself, because its windows are
+sent ahead of the answers.
+
+The two share one fate. `BEGIN` is inside the statement's own Sync, or its own
+Query string, and nothing else is sent until the server has answered for both.
+So a `BEGIN` the server refuses, as it does a serializable one on a hot
+standby, takes the statement down with it: the statement returns the server's
+error without having run. From then until the transaction is settled, the `Tx`
+and the connection itself return `ErrTxNotBegun` for everything, and
+`conn.TxStatus()` reports a failed transaction. The caller believes one is
+open, so nothing is let through to run, and commit, on its own.
+
+PostgreSQL takes a transaction's snapshot at its first statement, not at
+`BEGIN`, so what it sees is unchanged. Four things do differ from a `BEGIN`
+sent at once:
+
+- A connection that has died is found by the first statement rather than by
+  `Begin`.
+- `transaction_timestamp()` and `now()` are when that statement arrived.
+- A `BEGIN` the server refuses is reported by the first statement, as above.
+- A statement sent through `conn.Wire()` before the transaction's first
+  statement runs outside the transaction: the protocol connection underneath
+  knows nothing of a `BEGIN` still waiting.
+
+A first statement the server cannot parse leaves what it always has, a
+transaction open and failed for `Rollback` to end. Sent without arguments it
+shares one string with `BEGIN`, and the server refuses such a string whole, so
+it is sent again as its two parts. That is the one place the saved round trip
+is paid back, and only on an error.
+
+A `Tx` is spent once it is settled, a later transaction begins on its
+connection, or the connection is unwound: every method then returns
+`ErrTxClosed` and sends nothing, so a `Tx` kept past its transaction, or a
+savepoint kept past the transaction around it, cannot act on a later one. A
+transaction ended in SQL, by a `COMMIT` run as a statement, is not noticed,
+and its `Tx` stays live.
+
+A pool taking a connection back calls `conn.Unwind(ctx)`, which rolls back
+whatever its caller left open, spends every `Tx` begun on it, and costs
+nothing where the server has no transaction to end. `conn.TxStatus()` reports
+a transaction begun and not yet sent as open, and one whose `BEGIN` was
+refused as failed, so a pool that unwinds by that status catches both. Such a
+pool still has to keep its own account of who holds a connection, because the
+status of a transaction ended in SQL is idle.
 
 ### Batch and COPY
 
@@ -138,6 +189,59 @@ since the first failure aborts the transaction whatever follows, so the server
 is asked to answer a whole window at once instead of statement by statement.
 That is the fastest way to run many different statements: a million inserts in
 one transaction take a fifth of the client CPU of a pgx batch.
+
+### Behind a pooler
+
+A pooler in transaction mode, such as PgBouncer with `pool_mode = transaction`,
+lends a client a server connection for one transaction at a time, and outside
+a transaction that is for one Sync. A prepared statement lives on one server
+connection, so the statement cache is only for a pooler that follows prepared
+statements from one to the next, as PgBouncer does from 1.21 with
+`max_prepared_statements` set. Behind any other, turn it off:
+
+```go
+conn, err := caduceus.Connect(ctx, dsn, caduceus.Options{StatementCacheCapacity: -1})
+```
+
+Nothing on the server then outlives a Sync. A statement is parsed into the
+unnamed statement in the same Sync that binds and runs it, so it makes no
+difference which server connection the pooler lends for it. A batch is one
+Sync from end to end, and every statement of a pipeline has its own.
+
+A statement the connection has run before is still one round trip. The first
+time, the server is asked what the statement takes and returns, and the
+connection remembers the answer, for 64 statements unless
+`Options.DescriptionCacheCapacity` says otherwise; a negative capacity
+remembers nothing and asks every time. What is remembered is held to the
+server's word:
+
+- The statement is parsed with the parameter types it was described with, so
+  the server reads the arguments as they were encoded. A prepared statement
+  keeps the types it was prepared with in just the same way.
+- The server describes the columns again every time the statement runs, and
+  they are compared with what was remembered. If a table was altered in
+  between, the result is read as the server describes it now, and the
+  statement is asked about afresh the next time. `Rows.Fields` asked for
+  before the first `Next` reads as far as that description, which is already
+  on its way, so the columns it gives are this execution's.
+- The result was asked for in the formats that suited the columns
+  remembered, so a column that changed type arrives in the format its old
+  type was read in. A numeric, the commonest change, is read in binary as
+  the server prints it. A type that cannot be read in that format is refused
+  when it is scanned with `ErrResultChanged`, which says the statement ran:
+  a write that returned it was made.
+- An error before the server has bound the statement forgets the
+  description: the server did not take the statement, or an argument, as
+  encoded for the types remembered, whether it says so with class 42, an
+  invalid value or a type that no longer exists. An argument that cannot be
+  encoded for the type remembered does too. An error the statement raises as
+  it runs is its own, and leaves the description be.
+
+What this costs against the cache is the server's work, since an unnamed
+statement is parsed and planned every time it runs. A pipeline outside a
+transaction has every statement parsed for that reason, each being a Sync of
+its own; in a batch, or in a pipeline inside a transaction, a run of the same
+statement shares one Parse.
 
 ## Concurrency
 
@@ -252,6 +356,11 @@ reach an application that imports caduceus.
 go test -race ./...                                   # no database needed
 DATABASE_URL='postgres://…' go test -race ./...       # adds the live tests
 ```
+
+Two more variables add tests that need more than one server. `POOLER_URL`
+names a pooler in transaction mode in front of the same server, for the tests
+of what such a pooler does to a statement. `STANDBY_URL` names a hot standby,
+which is the one place a server refuses a `BEGIN`.
 
 ## License
 

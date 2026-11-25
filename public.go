@@ -37,11 +37,10 @@ func ConnectConfig(ctx context.Context, config *wire.Config, options Options) (*
 // one caller, and an application that shares one between goroutines must
 // serialise them itself.
 func New(conn *wire.Conn, options Options) *Conn {
-	c := &Conn{conn: conn}
 	if n := options.statements(); n > 0 {
-		c.cache = newStatementCache(n)
+		return &Conn{conn: conn, cache: newStatementCache(n)}
 	}
-	return c
+	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true}
 }
 
 // Exec runs a statement and returns its command tag, such as "UPDATE 3".
@@ -124,19 +123,33 @@ func (s *Conn) WaitForNotification(ctx context.Context) (wire.Notification, erro
 // not closed. A busy connection must not be handed to anyone else.
 func (s *Conn) Busy() bool { return s.open }
 
-// TxStatus is the server's transaction status as of the last ReadyForQuery:
-// 'I' idle, 'T' in a transaction, 'E' in a failed transaction.
-func (s *Conn) TxStatus() byte { return s.conn.TxStatus() }
+// TxStatus is the transaction status: 'I' idle, 'T' in a transaction, 'E' in a
+// failed transaction. It is the server's as of the last ReadyForQuery, except
+// for a transaction begun here: that one is 'T' while its BEGIN waits to be
+// sent, and 'E' once the server has refused the BEGIN, until it is settled. A
+// pool that takes connections back by this status is therefore right to unwind
+// both, and Unwind costs a round trip only where the server has a transaction
+// to roll back.
+//
+// While a result is open, the status is the one from before its statement and
+// says nothing of what that statement began; see Busy.
+func (s *Conn) TxStatus() byte { return s.txStatus() }
 
 // IsClosed reports whether the connection is closed or broken.
 func (s *Conn) IsClosed() bool { return s.conn.IsClosed() }
 
-// ForgetStatements drops every cached statement without telling the server,
-// for when the server has already dropped them, as DISCARD ALL does.
+// ForgetStatements drops everything the connection knows of statements without
+// telling the server: the prepared statements it keeps there, for when the
+// server has already dropped them, as DISCARD ALL does, and what it remembers
+// of statements it does not keep there, which was learned in a session that
+// has since been reset.
 func (s *Conn) ForgetStatements() { s.forgetStatements() }
 
 // Wire returns the underlying protocol connection, for what Conn does not
-// wrap. Using it while a result is open corrupts the exchange.
+// wrap. Using it while a result is open corrupts the exchange. It knows
+// nothing of a transaction begun here either: a BEGIN still waiting for the
+// transaction's first statement is not sent by it, so what goes through it
+// before that statement runs outside the transaction.
 func (s *Conn) Wire() *wire.Conn { return s.conn }
 
 // Close terminates the connection. It is idempotent.

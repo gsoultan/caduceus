@@ -21,7 +21,7 @@ var (
 )
 
 func errFormat(oid uint32, dest string) error {
-	return fmt.Errorf("caduceus/codec: cannot scan type %d into %s", oid, dest)
+	return &TypeError{OID: oid, Destination: dest}
 }
 
 func errEncode(oid uint32, value any) error {

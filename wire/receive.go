@@ -36,7 +36,8 @@ func (c *Conn) Receive() (byte, []byte, error) {
 				return 0, nil, c.fail(ErrProtocol)
 			}
 			c.txStatus = body[0]
-			c.idle, c.filled = !c.filled, false
+			c.calmed()
+			c.mark.settle()
 			return kind, body, nil
 		default:
 			return kind, body, nil
@@ -91,11 +92,17 @@ func (c *Conn) fill(n int) error {
 		return nil
 	}
 	c.makeRoom(n)
+	c.used = c.used || c.wide(n)
 	for c.rend-c.rpos < n {
 		read, err := c.netConn.Read(c.rbuf[c.rend:])
 		c.rend += read
-		c.streaming = c.rend == len(c.rbuf)
-		c.filled = c.filled || c.streaming
+		c.took(read)
+		// Full, and by a read of at least half of it: more was waiting than
+		// there was room for. A buffer the last bytes of a segment happened to
+		// fill says nothing of the kind, and a result that trickles in would
+		// otherwise grow one it has no use for.
+		c.streaming = c.rend == len(c.rbuf) && 2*read >= len(c.rbuf)
+		c.used = c.used || c.streamed(read)
 		if err == nil {
 			continue
 		}
@@ -103,6 +110,7 @@ func (c *Conn) fill(n int) error {
 			return nil
 		}
 		if isTimeout(err) {
+			c.overdue = true
 			return err
 		}
 		return c.fail(err)
@@ -111,13 +119,12 @@ func (c *Conn) fill(n int) error {
 }
 
 // makeRoom moves the unconsumed bytes to the front of the buffer and grows it
-// if n of them would still not fit. A buffer grown past shrinkAbove for a
-// message that is now gone is let go first.
+// if n of them would still not fit. A buffer the connection has no more use
+// for is let go first.
 func (c *Conn) makeRoom(n int) {
 	pending := c.rend - c.rpos
 	if pending == 0 && n <= initialReadBuffer && c.shrinkable() {
-		c.rbuf, c.rpos, c.rend = make([]byte, initialReadBuffer), 0, 0
-		c.streaming = false
+		c.giveBack()
 	}
 	if c.streaming && len(c.rbuf) < streamReadBuffer && n <= streamReadBuffer {
 		n = max(n, 2*len(c.rbuf))
@@ -127,6 +134,8 @@ func (c *Conn) makeRoom(n int) {
 		grown := make([]byte, max(n, 2*len(c.rbuf)))
 		copy(grown, c.rbuf[c.rpos:c.rend])
 		c.rbuf, c.rpos, c.rend = grown, 0, pending
+		// Whatever it grew for, the exchange in hand is using it.
+		c.used = true
 		return
 	}
 	if len(c.rbuf)-c.rpos < n || c.rpos == c.rend {
@@ -135,10 +144,56 @@ func (c *Conn) makeRoom(n int) {
 	}
 }
 
+// streamed accounts for a read, and reports whether the exchange has by now
+// read more than the initial buffer holds, through a buffer no larger than a
+// stream grows one. Such an exchange is what that buffer is for, however the
+// network cut it into reads. Told by the size of a read instead, a result that
+// arrives in segments gives back a buffer it will only grow again.
+func (c *Conn) streamed(read int) bool {
+	if c.got < initialReadBuffer {
+		c.got += read
+	}
+	return c.got >= initialReadBuffer && len(c.rbuf) <= streamReadBuffer
+}
+
+// wide reports whether a message of n bytes is one that a buffer grown past a
+// stream's, for a wide message, is the right size for: at least a quarter of
+// it. Anything narrower is read as well through what a stream grows, and must
+// not hold on to a buffer a single wide row left behind.
+func (c *Conn) wide(n int) bool {
+	return len(c.rbuf) > streamReadBuffer && 4*n >= len(c.rbuf)
+}
+
 // shrinkable reports whether the buffer is larger than this connection needs
-// now: grown for one large message, or for a stream that has since ended.
+// now: grown for one large message, or for results the connection has stopped
+// reading and the exchange in hand is not one of. Without that last condition
+// a result read after a run of short exchanges has its buffer taken away
+// whenever it stands empty, and grows it again with the next read.
 func (c *Conn) shrinkable() bool {
-	return len(c.rbuf) > shrinkAbove || (c.idle && len(c.rbuf) > initialReadBuffer)
+	return len(c.rbuf) > shrinkAbove || (c.calm >= calmExchanges && !c.used && len(c.rbuf) > initialReadBuffer)
+}
+
+// giveBack replaces an empty buffer with one of the initial size.
+func (c *Conn) giveBack() {
+	c.rbuf, c.rpos, c.rend = make([]byte, initialReadBuffer), 0, 0
+	c.streaming = false
+}
+
+// calmed ends an exchange for the read buffer. It counts how many in a row the
+// buffer was larger than they needed, and gives back there and then one the
+// connection has no more use for: a connection goes back to its pool at the
+// end of an exchange and may sit there, so a buffer let go only at the next
+// read is held for as long as it sits.
+func (c *Conn) calmed() {
+	if c.used {
+		c.calm = 0
+	} else if c.calm < calmExchanges {
+		c.calm++
+	}
+	c.used, c.got = false, 0
+	if c.rpos == c.rend && c.shrinkable() {
+		c.giveBack()
+	}
 }
 
 // isTimeout reports whether err is a deadline expiring.

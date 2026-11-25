@@ -145,6 +145,10 @@ func asString(oid uint32, format int16, src []byte) (string, error) {
 		return "f", nil
 	case Bytea:
 		return string(src), nil
+	case Numeric:
+		if text, ok := binaryNumeric(src); ok {
+			return text, nil
+		}
 	case UUID:
 		if len(src) == 16 {
 			return formatUUID(src), nil
@@ -185,14 +189,20 @@ func asInt(oid uint32, format int16, src []byte, dest any) (int64, error) {
 		}
 		return int64(f), nil
 	}
+	if text, ok := numericText(oid, src); ok {
+		return parseInt([]byte(text))
+	}
 	return 0, errFormat(oid, fmt.Sprintf("%T", dest))
 }
 
 func asFloat(oid uint32, format int16, src []byte, dest any) (float64, error) {
-	if src == nil {
+	switch {
+	case src == nil:
 		return 0, nullInto(dest)
-	}
-	if format == 0 {
+	case format == 0 && temporal(oid):
+		// A date's 'infinity' would parse as a float, and is not a number.
+		return 0, errFormat(oid, fmt.Sprintf("%T", dest))
+	case format == 0:
 		return parseFloat(src)
 	}
 	if f, ok := binaryFloat(oid, src); ok {
@@ -201,7 +211,27 @@ func asFloat(oid uint32, format int16, src []byte, dest any) (float64, error) {
 	if n, ok := binaryInt(oid, src); ok {
 		return float64(n), nil
 	}
+	if text, ok := numericText(oid, src); ok {
+		return parseFloat([]byte(text))
+	}
 	return 0, errFormat(oid, fmt.Sprintf("%T", dest))
+}
+
+// numericText is the text of a binary numeric, and reports whether src is one.
+func numericText(oid uint32, src []byte) (string, bool) {
+	if oid != Numeric {
+		return "", false
+	}
+	return binaryNumeric(src)
+}
+
+// temporal reports whether a type is a date, a time or an interval.
+func temporal(oid uint32) bool {
+	switch oid {
+	case Date, Time, Timestamp, Timestamptz, Interval:
+		return true
+	}
+	return false
 }
 
 func asBool(oid uint32, format int16, src []byte, dest any) (bool, error) {
@@ -217,15 +247,29 @@ func asBool(oid uint32, format int16, src []byte, dest any) (bool, error) {
 	return false, errFormat(oid, "bool")
 }
 
-// asBytes returns a copy: the source aliases the connection's buffer.
+// asBytes returns a column's bytes as they arrive in the format its type is
+// asked for in, which for bytea is the bytes it holds and for jsonb its text.
+// It returns a copy: the source aliases the connection's buffer.
+//
+// A column can arrive in the other format, when the statement's result changed
+// type since it was described and its format was chosen for the type it had.
+// The bytes would then be another representation of the value than they are
+// every other time: so a binary value is given as its text where the codec can
+// print it, as its type is asked for, and the text of a type asked for in
+// binary is refused.
 func asBytes(oid uint32, format int16, src []byte) ([]byte, error) {
 	switch {
 	case format == 0 && oid == Bytea:
 		return decodeByteaText(src)
 	case format == 1 && oid == JSONB && len(src) > 0 && src[0] == 1:
 		return append([]byte{}, src[1:]...), nil
+	case format == ResultFormat(oid) || textual(oid):
+		return append([]byte{}, src...), nil
+	case format == 1:
+		text, err := asString(oid, format, src)
+		return []byte(text), err
 	}
-	return append([]byte{}, src...), nil
+	return nil, errFormat(oid, "[]byte")
 }
 
 func asTime(oid uint32, format int16, src []byte) (time.Time, error) {
@@ -299,6 +343,9 @@ func Natural(oid uint32, format int16, src []byte) (any, error) {
 		return formatInterval(i), nil
 	case JSONB:
 		return unmarshalAny(src[min(1, len(src)):])
+	case JSON:
+		// Its binary form is its text.
+		return unmarshalAny(src)
 	}
 	if element, ok := arrayElements[oid]; ok {
 		return naturalArray(element, src)
@@ -313,7 +360,59 @@ func naturalText(oid uint32, src []byte) (any, error) {
 	case Bytea:
 		return decodeByteaText(src)
 	}
+	if ResultFormat(oid) == 1 {
+		return naturalFromText(oid, src)
+	}
 	return string(src), nil
+}
+
+// naturalFromText is Natural for the text of a type that is asked for in
+// binary. It arrives as text only when a statement's result changed type
+// since it was described and its format was chosen for the type the column
+// had, and it is read into the same Go value its binary form gives. An
+// interval or an array, whose text the codec does not parse, is refused.
+func naturalFromText(oid uint32, src []byte) (any, error) {
+	switch oid {
+	case Int2, Int4, Int8, OID:
+		return naturalInt(oid, src)
+	case Float4:
+		f, err := parseFloat(src)
+		return float32(f), err
+	case Float8:
+		return parseFloat(src)
+	case Bool:
+		return parseBool(src)
+	case UUID:
+		return parseUUID(string(src))
+	case Time:
+		return string(src), nil
+	case Date, Timestamp, Timestamptz:
+		t, err := parseTimestampText(oid, string(src))
+		if err == errInfinite {
+			return string(src), nil
+		}
+		return t, err
+	}
+	return nil, errFormat(oid, "any")
+}
+
+// naturalInt reads the text of an integer into the Go type its binary form
+// gives.
+func naturalInt(oid uint32, src []byte) (any, error) {
+	n, err := parseInt(src)
+	switch {
+	case err != nil:
+		return nil, err
+	case oid == Int8:
+		return n, nil
+	case oid == Int4 && n >= math.MinInt32 && n <= math.MaxInt32:
+		return int32(n), nil
+	case oid == Int2 && n >= math.MinInt16 && n <= math.MaxInt16:
+		return int16(n), nil
+	case oid == OID && n >= 0 && n <= math.MaxUint32:
+		return uint32(n), nil
+	}
+	return nil, ErrOverflow
 }
 
 func unmarshalAny(src []byte) (any, error) {
@@ -442,12 +541,12 @@ func scanKind(oid uint32, format int16, src []byte, value reflect.Value, dest an
 		}
 		return scanArray(oid, format, src, value)
 	}
-	return fmt.Errorf("caduceus/codec: cannot scan type %d into %T", oid, dest)
+	return errFormat(oid, fmt.Sprintf("%T", dest))
 }
 
 func scanUUIDArray(oid uint32, format int16, src []byte, value reflect.Value, dest any) error {
 	if value.Len() != 16 || value.Type().Elem().Kind() != reflect.Uint8 || oid != UUID {
-		return fmt.Errorf("caduceus/codec: cannot scan type %d into %T", oid, dest)
+		return errFormat(oid, fmt.Sprintf("%T", dest))
 	}
 	var u [16]byte
 	if format == 1 && len(src) == 16 {

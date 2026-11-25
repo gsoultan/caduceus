@@ -27,6 +27,7 @@ type Guard struct {
 // is blocked, that call returns a timeout, which Done turns into ctx's error.
 func (c *Conn) Watch(ctx context.Context) Guard {
 	g := Guard{conn: c, ctx: ctx}
+	c.overdue = false
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetDeadline(deadline)
 		g.deadline = true
@@ -45,29 +46,35 @@ func (c *Conn) Watch(ctx context.Context) Guard {
 // whatever it is running and the connection is closed: where its stream stands
 // is no longer known, and a pool must not hand it to anyone. The returned error
 // then wraps the context's, so errors.Is(err, context.DeadlineExceeded) holds.
+//
+// The connection is closed the same way when a read or a write of the exchange
+// ran into a deadline that was not the context's: one left on the socket by
+// whoever used it before. A timeout leaves a connection intact between
+// exchanges, never in the middle of one, where what was sent is still to be
+// answered and the next exchange would read those replies as its own. The
+// error is then returned as it is, for the context has not ended.
+//
+// An error that only happens to be a timeout, with the connection's own reads
+// and writes all on time, is the exchange's business and is returned as it is.
 func (g Guard) Done(err error) error {
 	fired := g.stop != nil && !g.stop()
-	// Every deadline on the connection comes from the context, so a timeout
-	// means it ended, even in the instant before ctx.Err() says so.
-	guarded := g.deadline || g.stop != nil
-	if fired || (err != nil && guarded && isTimeout(err)) {
-		g.conn.abort()
-		awaitExpiry(g.ctx)
-		cause := context.Cause(g.ctx)
-		if cause == nil {
-			cause = context.DeadlineExceeded
+	if !fired && !g.conn.overdue {
+		if g.deadline && !g.conn.closed.Load() {
+			_ = g.conn.netConn.SetDeadline(time.Time{})
 		}
-		if err == nil {
-			// The exchange finished as the context ended. Its result stands,
-			// but the connection's deadline is already in the past.
-			return nil
-		}
-		return fmt.Errorf("caduceus: %w (%w)", cause, err)
+		return err
 	}
-	if g.deadline && !g.conn.closed.Load() {
-		_ = g.conn.netConn.SetDeadline(time.Time{})
+	g.conn.abort()
+	// The socket notices a deadline before the context says it has passed.
+	awaitExpiry(g.ctx)
+	cause := context.Cause(g.ctx)
+	if cause == nil || err == nil {
+		// The context is alive, so the deadline was not its own. Or the
+		// exchange finished as the context ended: its result stands, though
+		// the connection's deadline is already in the past.
+		return err
 	}
-	return err
+	return fmt.Errorf("caduceus: %w (%w)", cause, err)
 }
 
 // abort asks the server to cancel the running query and closes the connection.

@@ -23,10 +23,16 @@ func (c *Conn) WaitForNotification(ctx context.Context) (Notification, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetReadDeadline(deadline)
 	}
-	netConn := c.netConn
-	stop := context.AfterFunc(ctx, func() { _ = netConn.SetReadDeadline(time.Unix(1, 0)) })
+	hold := interrupt(ctx, c.netConn)
+	// A wait has no result to run long: what it reads is counted towards
+	// nothing, or hours of notifications would add up to a raised mark and one
+	// of them held back behind it.
+	c.mark.forgo()
 	defer func() {
-		stop()
+		c.mark.settle()
+		// Released before the deadline is cleared, so that nothing can move it
+		// again afterwards.
+		hold.release()
 		if !c.closed.Load() {
 			_ = c.netConn.SetReadDeadline(time.Time{})
 		}

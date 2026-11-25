@@ -135,14 +135,50 @@ func parseBool(src []byte) (bool, error) {
 	return false, strconv.ErrSyntax
 }
 
-// decodeByteaText reads bytea's text output, which is hex since PostgreSQL 9.0.
+// decodeByteaText reads bytea's text output: hex, the default since
+// PostgreSQL 9.0, or escape, which bytea_output can still choose.
 func decodeByteaText(src []byte) ([]byte, error) {
 	if len(src) >= 2 && src[0] == '\\' && src[1] == 'x' {
 		out := make([]byte, hex.DecodedLen(len(src)-2))
 		_, err := hex.Decode(out, src[2:])
 		return out, err
 	}
-	return append([]byte{}, src...), nil
+	return decodeByteaEscape(src)
+}
+
+// decodeByteaEscape reads bytea's escape format, in which a backslash is
+// doubled and a byte that is not printable is a backslash and three octal
+// digits. It used to be taken for the bytes themselves.
+func decodeByteaEscape(src []byte) ([]byte, error) {
+	out := make([]byte, 0, len(src))
+	for len(src) > 0 {
+		b, size, ok := byteaEscaped(src)
+		if !ok {
+			return nil, strconv.ErrSyntax
+		}
+		out = append(out, b)
+		src = src[size:]
+	}
+	return out, nil
+}
+
+// byteaEscaped reads the byte at the start of src in the escape format, and
+// how much text it took.
+func byteaEscaped(src []byte) (byte, int, bool) {
+	switch {
+	case src[0] != '\\':
+		return src[0], 1, true
+	case len(src) >= 2 && src[1] == '\\':
+		return '\\', 2, true
+	case len(src) >= 4 && octal(src[1], '3') && octal(src[2], '7') && octal(src[3], '7'):
+		return (src[1]-'0')<<6 | (src[2]-'0')<<3 | (src[3] - '0'), 4, true
+	}
+	return 0, 0, false
+}
+
+// octal reports whether c is an octal digit no greater than highest.
+func octal(c, highest byte) bool {
+	return c >= '0' && c <= highest
 }
 
 func formatFloat(f float64) string {
@@ -210,55 +246,57 @@ func insertZone(text string) string {
 	return text + "+00"
 }
 
-// formatInterval renders an interval in PostgreSQL's default IntervalStyle.
+// formatInterval renders an interval as PostgreSQL does in its default
+// IntervalStyle: each part that is not zero, a unit plural unless the count is
+// exactly 1, so -1 years, and a plus sign on a part that follows a negative
+// one. It used to write "-1 year" and leave out the plus, so an interval read
+// as a string differed from the server's own text of it.
 func formatInterval(i interval) string {
 	var b strings.Builder
+	zero, afterNegative := true, false
 	part := func(n int64, unit string) {
 		if n == 0 {
 			return
 		}
-		if b.Len() > 0 {
+		if !zero {
 			b.WriteByte(' ')
+		}
+		if afterNegative && n > 0 {
+			b.WriteByte('+')
 		}
 		b.WriteString(strconv.FormatInt(n, 10))
 		b.WriteByte(' ')
 		b.WriteString(unit)
-		if n != 1 && n != -1 {
+		if n != 1 {
 			b.WriteByte('s')
 		}
+		zero, afterNegative = false, n < 0
 	}
-	years, months := int64(i.months/12), int64(i.months%12)
-	part(years, "year")
-	if months != 0 {
-		if b.Len() > 0 {
-			b.WriteByte(' ')
-		}
-		b.WriteString(strconv.FormatInt(months, 10))
-		if months == 1 || months == -1 {
-			b.WriteString(" mon")
-		} else {
-			b.WriteString(" mons")
-		}
-	}
+	part(int64(i.months/12), "year")
+	part(int64(i.months%12), "mon")
 	part(int64(i.days), "day")
-	if i.micros != 0 || b.Len() == 0 {
-		if b.Len() > 0 {
-			b.WriteByte(' ')
-		}
-		micros := i.micros
-		if micros < 0 {
-			b.WriteByte('-')
-			micros = -micros
-		}
-		hours, rest := micros/3_600_000_000, micros%3_600_000_000
-		b.WriteString(pad2(hours))
-		b.WriteByte(':')
-		b.WriteString(pad2(rest / 60_000_000))
-		b.WriteByte(':')
-		b.WriteString(pad2(rest % 60_000_000 / 1_000_000))
-		if fraction := rest % 1_000_000; fraction != 0 {
-			b.WriteString(strings.TrimRight("."+strconv.FormatInt(1_000_000+fraction, 10)[1:], "0"))
-		}
+	if !zero && i.micros == 0 {
+		return b.String()
+	}
+	if !zero {
+		b.WriteByte(' ')
+	}
+	micros := i.micros
+	switch {
+	case micros < 0:
+		b.WriteByte('-')
+		micros = -micros
+	case afterNegative:
+		b.WriteByte('+')
+	}
+	hours, rest := micros/3_600_000_000, micros%3_600_000_000
+	b.WriteString(pad2(hours))
+	b.WriteByte(':')
+	b.WriteString(pad2(rest / 60_000_000))
+	b.WriteByte(':')
+	b.WriteString(pad2(rest % 60_000_000 / 1_000_000))
+	if fraction := rest % 1_000_000; fraction != 0 {
+		b.WriteString(strings.TrimRight("."+strconv.FormatInt(1_000_000+fraction, 10)[1:], "0"))
 	}
 	return b.String()
 }

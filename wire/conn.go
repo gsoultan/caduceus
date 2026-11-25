@@ -20,11 +20,17 @@ const initialReadBuffer = 8 << 10
 const shrinkAbove = 256 << 10
 
 // streamReadBuffer is what the buffer grows to while a result streams in
-// faster than it is read: a read that fills every free byte means more was
-// waiting. Eight times fewer reads for a large result, and given back once an
-// exchange no longer fills it, so a connection holds it only while it is
-// reading large results.
+// faster than it is read: a read that fills it means more was waiting. Eight
+// times fewer reads for a large result, and given back once the connection has
+// stopped reading results the initial buffer could not hold, so a connection
+// holds it only while it is reading large results.
 const streamReadBuffer = 64 << 10
+
+// calmExchanges is how many exchanges in a row must have no use for a grown
+// read buffer before it is given back. One was too few: the windows of a
+// pipeline fill it every other time, and it was freed and grown again for
+// each, 22 MiB of garbage for a million statements.
+const calmExchanges = 8
 
 // Conn is one connection to PostgreSQL after login.
 //
@@ -39,12 +45,17 @@ type Conn struct {
 	// exactly where it was and the connection usable.
 	rbuf       []byte
 	rpos, rend int
-	// streaming is a last read that filled the buffer, which means more was
-	// waiting; filled is any read that did so since the last ReadyForQuery.
-	// idle is an exchange that ended without one: the buffer is larger than
-	// what the connection is being used for, and is given back. A connection
-	// that reads large results back to back keeps its buffer between them.
-	streaming, filled, idle bool
+	// streaming is a last read that filled the buffer and brought at least
+	// half of it, which means more was waiting than there was room for. got
+	// is how much the exchange in hand has read, as far as it matters, and
+	// used whether that exchange is one the buffer is the right size for.
+	// calm counts the exchanges in a row that ended without being one: after
+	// calmExchanges of them the buffer is larger than what the connection is
+	// being used for, and is given back. A connection that reads large
+	// results back to back keeps its buffer between them.
+	streaming, used bool
+	calm            uint8
+	got             int
 	// wbuf is lent to the caller by Buffer and returned by Send, so encoding a
 	// query allocates nothing once the connection has warmed up.
 	wbuf []byte
@@ -55,6 +66,15 @@ type Conn struct {
 	txStatus byte
 
 	notifications []Notification
+
+	// mark coalesces the wakeups of a long result.
+	mark watermark
+
+	// overdue is a read or a write that has run into a deadline since the
+	// last exchange began. Between exchanges that is a wait ending; inside one
+	// it is a reply left unread, which the exchange's Guard answers by closing
+	// the connection.
+	overdue bool
 
 	closed atomic.Bool
 }
@@ -98,7 +118,7 @@ func (c *Conn) Send(messages []byte) error {
 		c.wbuf = nil
 	}
 	if err != nil {
-		return c.fail(err)
+		return c.unsent(err)
 	}
 	return nil
 }
@@ -110,9 +130,17 @@ func (c *Conn) Write(messages []byte) error {
 		return ErrClosed
 	}
 	if _, err := c.netConn.Write(messages); err != nil {
-		return c.fail(err)
+		return c.unsent(err)
 	}
 	return nil
+}
+
+// unsent closes the connection after a write that failed, part of which may
+// have gone out, and returns the error. One that ran into a deadline is
+// remembered for the exchange's Guard, which says whose deadline it was.
+func (c *Conn) unsent(err error) error {
+	c.overdue = c.overdue || isTimeout(err)
+	return c.fail(err)
 }
 
 // Keep leaves the buffer last lent by Buffer with the caller, who will send it

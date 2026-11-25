@@ -2,8 +2,10 @@
 
 package caduceus
 
-// statementCache holds a connection's prepared statements by SQL, evicting the
-// least recently used past its capacity.
+// statementCache holds a connection's statements by SQL, evicting the least
+// recently used past its capacity. They are prepared statements kept on the
+// server, or, for a connection that keeps none there, what the server said of
+// statements that are parsed every time they run.
 //
 // The map is allocated small and grows with use, unlike pgx's caches, which
 // preallocated their full capacity on every connection: that was 57% of the
@@ -30,8 +32,19 @@ func (c *statementCache) get(sql string) *statement {
 }
 
 // put adds a statement and returns the one it evicted, if any, so its server
-// side can be closed.
+// side can be closed. A cache with no capacity keeps nothing.
+//
+// A statement for a text the cache already holds takes the place of the one
+// it holds, which is the one evicted. Pushed in beside it instead, the old one
+// stayed in the recency list and out of the map, and once it was the oldest
+// every eviction picked it and removed nothing: the map grew without bound.
 func (c *statementCache) put(s *statement) *statement {
+	if c.capacity <= 0 {
+		return nil
+	}
+	if held := c.bySQL[s.sql]; held != nil {
+		return c.replace(held, s)
+	}
 	c.bySQL[s.sql] = s
 	c.push(s)
 	if len(c.bySQL) <= c.capacity {
@@ -40,6 +53,17 @@ func (c *statementCache) put(s *statement) *statement {
 	oldest := c.head.prev
 	c.remove(oldest)
 	return oldest
+}
+
+// replace puts s where held is, and returns held, unless the two are one.
+func (c *statementCache) replace(held, s *statement) *statement {
+	c.unlink(held)
+	c.bySQL[s.sql] = s
+	c.push(s)
+	if held == s {
+		return nil
+	}
+	return held
 }
 
 // remove forgets a statement.
@@ -51,16 +75,11 @@ func (c *statementCache) remove(s *statement) {
 	c.unlink(s)
 }
 
-// clear forgets every statement and returns them, for their server sides to be
-// closed.
-func (c *statementCache) clear() []*statement {
-	all := make([]*statement, 0, len(c.bySQL))
-	for _, s := range c.bySQL {
-		all = append(all, s)
-	}
+// clear forgets every statement. A pool that resets its connections calls it
+// on every release, so it allocates nothing.
+func (c *statementCache) clear() {
 	clear(c.bySQL)
 	c.head = nil
-	return all
 }
 
 func (c *statementCache) push(s *statement) {

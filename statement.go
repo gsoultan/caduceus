@@ -7,10 +7,12 @@ import (
 	"github.com/gsoultan/caduceus/wire"
 )
 
-// statement is a parsed statement and what the server said about it: the types
-// of its parameters, which decide how each argument is encoded, and the columns
-// of its result, which decide the format each is asked for in.
+// statement is a statement and what the server said about it: the types of its
+// parameters, which decide how each argument is encoded, and the columns of
+// its result, which decide the format each is asked for in.
 type statement struct {
+	// name is the statement's on the server, or empty for one that is not kept
+	// there and is parsed into the unnamed statement every time it runs.
 	name   string
 	sql    string
 	params []uint32
@@ -46,4 +48,49 @@ func newStatement(name, sql string, params []uint32, fields []wire.Field) *state
 		}
 	}
 	return s
+}
+
+// restated is the statement as the server now describes its result, for
+// reading a result that was asked for in s's formats: every column keeps the
+// format it was requested in, whatever type it turns out to have.
+func (s *statement) restated(fields []wire.Field) *statement {
+	for i := range fields {
+		fields[i].Format = s.requested(i)
+	}
+	return &statement{sql: s.sql, params: s.params, fields: fields, formats: s.formats}
+}
+
+// requested returns the format column i of the result was asked for in.
+func (s *statement) requested(i int) int16 {
+	switch {
+	case len(s.formats) == 1:
+		return s.formats[0]
+	case i < len(s.formats):
+		return s.formats[i]
+	}
+	// No formats asks for text. More columns than formats is a Bind the server
+	// refuses, so there is no result to read.
+	return wire.TextFormat
+}
+
+// describes reports whether a RowDescription or a NoData is what stmt's
+// columns were remembered as.
+func describes(stmt *statement, kind byte, body []byte) bool {
+	if kind == wire.MsgNoData {
+		return len(stmt.fields) == 0
+	}
+	return wire.SameRowDescription(stmt.fields, body)
+}
+
+// restate puts fresh in place of old wherever a batch or a pipeline was going
+// to read a result with old.
+func restate(stmts []*statement, old, fresh *statement) {
+	if old == fresh {
+		return
+	}
+	for i := range stmts {
+		if stmts[i] == old {
+			stmts[i] = fresh
+		}
+	}
 }

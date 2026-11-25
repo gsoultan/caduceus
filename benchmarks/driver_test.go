@@ -202,6 +202,71 @@ func BenchmarkQueryRow(b *testing.B) {
 	})
 }
 
+// BenchmarkQueryRowNothingKept is BenchmarkQueryRow in the mode each driver
+// has for a pooler in transaction mode that does not follow prepared
+// statements: nothing kept on the server from one Sync to the next.
+//
+// caduceus and pgx's cache_describe remember what the server said of a
+// statement and send its Parse with its Bind, one round trip. pgx's exec does
+// not ask at all, and sends every argument as text of a type it guesses from
+// the Go value. The last two ask every time, which is two round trips; pgx's
+// describe_exec binds in the second what it parsed in the first, which is the
+// thing such a pooler breaks, and is here for what asking costs.
+func BenchmarkQueryRowNothingKept(b *testing.B) {
+	ctx := b.Context()
+	url := dsn(b)
+	var contenders []contender
+	var got int64
+	for _, mode := range []struct {
+		name    string
+		options caduceus.Options
+	}{
+		{"caduceus", caduceus.Options{StatementCacheCapacity: -1}},
+		{"caduceus-asking-every-time", caduceus.Options{StatementCacheCapacity: -1, DescriptionCacheCapacity: -1}},
+	} {
+		conn, err := caduceus.Connect(ctx, url, mode.options)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = conn.Close(context.Background()) })
+		contenders = append(contenders, contender{mode.name, func(b *testing.B, ctx context.Context) {
+			for i := 0; b.Loop(); i++ {
+				if err := conn.QueryRow(ctx, "SELECT $1::int8 + 1", int64(i)).Scan(&got); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}})
+	}
+	for _, mode := range []struct {
+		name string
+		mode pgx.QueryExecMode
+	}{
+		{"pgx-cache-describe", pgx.QueryExecModeCacheDescribe},
+		{"pgx-exec", pgx.QueryExecModeExec},
+		{"pgx-describe-exec", pgx.QueryExecModeDescribeExec},
+	} {
+		config, err := pgx.ParseConfig(url)
+		if err != nil {
+			b.Fatal(err)
+		}
+		config.DefaultQueryExecMode = mode.mode
+		conn, err := pgx.ConnectConfig(ctx, config)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = conn.Close(context.Background()) })
+		contenders = append(contenders, contender{mode.name, func(b *testing.B, ctx context.Context) {
+			for i := 0; b.Loop(); i++ {
+				if err := conn.QueryRow(ctx, "SELECT $1::int8 + 1", int64(i)).Scan(&got); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}})
+	}
+	// The order they were added in is the order they run in.
+	runAll(b, []contender{contenders[0], contenders[2], contenders[3], contenders[1], contenders[4]})
+}
+
 func BenchmarkRows100(b *testing.B) {
 	cad, px, db := connections(b)
 	runAll(b, []contender{
@@ -294,6 +359,72 @@ func BenchmarkTransaction(b *testing.B) {
 				}
 				if _, err := tx.ExecContext(ctx, insert, int64(i), "note"); err != nil {
 					b.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
+	})
+}
+
+// A transaction around a batch: BEGIN, ten inserts sent together, COMMIT.
+// database/sql has no batch, so it runs the inserts one after another.
+func BenchmarkTransactionBatch10(b *testing.B) {
+	cad, px, db := connections(b)
+	table := benchTable(b, cad)
+	insert := "INSERT INTO " + table + " VALUES ($1, $2)"
+	runAll(b, []contender{
+		{"caduceus", func(b *testing.B, ctx context.Context) {
+			queries := make([]caduceus.Query, 10)
+			for i := range queries {
+				queries[i] = caduceus.Query{SQL: insert, Arguments: []any{int64(i), "note"}}
+			}
+			for b.Loop() {
+				tx, err := cad.Begin(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				results, err := tx.SendBatch(ctx, queries)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := results.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
+		{"pgx", func(b *testing.B, ctx context.Context) {
+			for b.Loop() {
+				tx, err := px.Begin(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				batch := &pgx.Batch{}
+				for i := range 10 {
+					batch.Queue(insert, int64(i), "note")
+				}
+				if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
+		{"database-sql", func(b *testing.B, ctx context.Context) {
+			for b.Loop() {
+				tx, err := db.BeginTx(ctx, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for i := range 10 {
+					if _, err := tx.ExecContext(ctx, insert, int64(i), "note"); err != nil {
+						b.Fatal(err)
+					}
 				}
 				if err := tx.Commit(); err != nil {
 					b.Fatal(err)

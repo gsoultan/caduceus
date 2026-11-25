@@ -41,6 +41,32 @@ func ParseRowDescription(dst []Field, body []byte) ([]Field, error) {
 	return dst, nil
 }
 
+// SameRowDescription reports whether a RowDescription body describes exactly
+// fields, their formats aside. It allocates nothing, which is what lets a
+// description that is remembered be checked against the server's on every
+// execution.
+func SameRowDescription(fields []Field, body []byte) bool {
+	if len(body) < 2 || int(be16(body)) != len(fields) {
+		return false
+	}
+	body = body[2:]
+	for i := range fields {
+		field := &fields[i]
+		name := len(field.Name)
+		if len(body) < name+19 || body[name] != 0 || string(body[:name]) != field.Name {
+			return false
+		}
+		rest := body[name+1:]
+		if be32(rest) != field.TableOID || be16(rest[4:]) != field.TableAttributeNumber ||
+			be32(rest[6:]) != field.DataTypeOID || int16(be16(rest[10:])) != field.DataTypeSize ||
+			int32(be32(rest[12:])) != field.TypeModifier {
+			return false
+		}
+		body = rest[18:]
+	}
+	return true
+}
+
 // ParseParameterDescription reads a ParameterDescription body into the types
 // the server resolved for each parameter.
 func ParseParameterDescription(dst []uint32, body []byte) ([]uint32, error) {

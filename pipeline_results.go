@@ -14,7 +14,19 @@ import (
 // anything, so they are taken off the client's hands even by a server that has
 // stopped reading because the client has not read its replies. Anything
 // larger and the two could each be waiting for the other to read.
+//
+// A window closes once it has passed the size, so it is the size and one
+// statement more. A statement larger than a window by itself, a long text or a
+// large argument, goes in a window of its own, sent only once every statement
+// before it has been read: the server answers nothing of a statement until it
+// has read the whole of it, so with nothing else owed to the client it is
+// always reading. Sent behind the statements before it, megabytes of it could
+// be waiting on a server that was waiting on the client to read their results.
 const pipelineWindow = 32 << 10
+
+// oversized reports whether an encoded statement of n bytes is too large to
+// share a window.
+func oversized(n int) bool { return n > pipelineWindow }
 
 // PipelineResults reads a pipeline's results, one statement at a time, in
 // the order they were queued.
@@ -30,11 +42,16 @@ const pipelineWindow = 32 << 10
 // which lets the server answer a whole window in a few packets rather than
 // one per statement: after a failure the rest of its window is skipped by the
 // server and reports the same error, and later windows fail with 25P02.
+//
+// On a connection that keeps no statements on the server, a statement is
+// parsed in every Sync that runs it. Outside a transaction that is once for
+// every statement of the pipeline, which is what its statements each being a
+// transaction of their own costs there; inside one it is once for a run of
+// the same statement in a window.
 type PipelineResults struct {
-	session   *Conn
-	queries   []Query
-	stmts     []*statement
-	temporary []string
+	session *Conn
+	queries []Query
+	stmts   []*statement
 
 	// grouped is a pipeline inside a transaction block, where a window of
 	// statements shares one Sync. ends holds, for each window sent and not
@@ -56,8 +73,10 @@ type PipelineResults struct {
 	sent   int
 	failed map[int]error
 	// windowStart is the first statement of the last window sent; reading it
-	// is the signal to send the next.
+	// is the signal to send the next. held is the statement after that window
+	// held back from it, too large to share one.
 	windowStart int
+	held        bool
 
 	next    int
 	current *Rows
@@ -78,11 +97,19 @@ func (s *Conn) SendPipeline(ctx context.Context, queries []Query) (*PipelineResu
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}
-	stmts, temporary, err := s.prepareBatch(queries)
+	stmts, err := s.prepareBatch(queries)
 	if err != nil {
 		return nil, s.finish(err)
 	}
-	p := &PipelineResults{session: s, queries: queries, stmts: stmts, temporary: temporary}
+	// A transaction's BEGIN went with the describe, if there was one. One
+	// still waiting goes alone and is answered first: only the first window
+	// could carry it, and the windows behind it are sent before that window
+	// is answered, so behind a BEGIN the server refused they would run, and
+	// commit, on their own.
+	if err := s.flushBegin(); err != nil {
+		return nil, s.finish(err)
+	}
+	p := &PipelineResults{session: s, queries: queries, stmts: stmts}
 	p.grouped = s.conn.TxStatus() != wire.TxIdle
 	if err := p.sendWindow(); err != nil {
 		return nil, s.finish(err)
@@ -90,34 +117,65 @@ func (s *Conn) SendPipeline(ctx context.Context, queries []Query) (*PipelineResu
 	return p, nil
 }
 
-// sendWindow encodes and sends the next window of statements, and after the
-// last of them closes any statements prepared only for this pipeline.
+// sendWindow encodes and sends the next window of statements.
 func (p *PipelineResults) sendWindow() error {
-	p.windowStart = p.sent
+	p.windowStart, p.held = p.sent, false
 	buf := p.session.conn.Buffer()
-	for p.sent < len(p.queries) && len(buf) < pipelineWindow {
-		encoded, err := appendBind(buf, p.stmts[p.sent], p.queries[p.sent].Arguments)
-		if err != nil {
-			p.recordFailure(p.sent, err)
-		} else {
-			buf = wire.AppendExecute(encoded, "", 0)
-		}
-		if !p.grouped {
-			buf = wire.AppendSync(buf)
-		}
-		p.sent++
+	// parsed is the statement the unnamed statement holds since the last Sync,
+	// for a connection that keeps none on the server: nothing at the start of
+	// a window, and nothing again after every Sync.
+	var parsed *statement
+	for p.sent < len(p.queries) && len(buf) < pipelineWindow && !p.held {
+		buf, parsed = p.encodeNext(buf, parsed)
 	}
 	if p.grouped {
 		buf = wire.AppendSync(buf)
 		p.ends = append(p.ends, p.sent)
 	}
-	if p.sent == len(p.queries) && len(p.temporary) > 0 {
-		for _, name := range p.temporary {
-			buf = wire.AppendClose(buf, 'S', name)
-		}
-		buf = wire.AppendSync(buf)
-	}
 	return p.session.conn.Send(buf)
+}
+
+// encodeNext appends the next statement to the window in buf, parsed unless it
+// is the one parsed last in its Sync, and returns the window and the statement
+// parsed last now. One too large to share a window is held back for a window
+// of its own, and not counted sent.
+func (p *PipelineResults) encodeNext(buf []byte, parsed *statement) ([]byte, *statement) {
+	stmt := statementAt(p.stmts, p.sent)
+	encoded := buf
+	if stmt != parsed {
+		encoded = appendParsed(encoded, stmt)
+	}
+	encoded, err := p.session.appendBound(encoded, stmt, p.queries[p.sent].Arguments)
+	switch {
+	case err != nil:
+		// What was encoded of it is left behind buf, to be written over.
+		p.recordFailure(p.sent, err)
+	case oversized(len(encoded)-len(buf)) && p.sent > p.windowStart:
+		p.held = true
+		return buf, parsed
+	default:
+		buf, parsed = wire.AppendExecute(encoded, "", 0), stmt
+	}
+	if !p.grouped {
+		buf, parsed = wire.AppendSync(buf), nil
+	}
+	p.sent++
+	return buf, parsed
+}
+
+// due reports whether the next window is to be sent before the statement at
+// next is read: once the reader has reached the last window sent, which keeps
+// the server supplied and never has more than two windows unread by it, and
+// for a statement held back, too large to share a window, once every
+// statement before it has been read.
+func (p *PipelineResults) due() bool {
+	switch {
+	case p.sent >= len(p.queries):
+		return false
+	case p.held:
+		return p.next >= p.sent
+	}
+	return p.next >= p.windowStart
 }
 
 func (p *PipelineResults) recordFailure(i int, err error) {
@@ -139,14 +197,14 @@ func (p *PipelineResults) statementInto(rows *Rows) error {
 	if p.next >= len(p.queries) {
 		return errBatchExhausted
 	}
-	if p.next >= p.windowStart && p.sent < len(p.queries) {
+	if p.due() {
 		if err := p.sendWindow(); err != nil {
 			p.settled = true
 			return p.remember(p.session.finish(err))
 		}
 	}
 	*rows = Rows{}
-	rows.init(p.session, p.stmts[p.next], true)
+	rows.init(p.session, statementAt(p.stmts, p.next), true)
 	rows.ownSync = !p.grouped
 	p.live = true
 	if err, ok := p.failed[p.next]; ok {
@@ -170,6 +228,9 @@ func (p *PipelineResults) finishCurrent() {
 	current := p.current
 	p.current = nil
 	current.Close()
+	// The server described the statement differently from how it was
+	// remembered, which the statements that share its Parse cannot see.
+	restate(p.stmts, statementAt(p.stmts, p.next-1), current.stmt)
 	if current.err != nil && p.failure == nil {
 		p.failure = current.err
 	}
@@ -251,14 +312,6 @@ func (p *PipelineResults) Close() error {
 	p.finishCurrent()
 	if p.settled {
 		return p.failure
-	}
-	if len(p.temporary) > 0 {
-		// The trailing Close of the pipeline's own statements has one more
-		// ReadyForQuery.
-		if _, err := p.session.drain(nil); err != nil {
-			p.settled = true
-			return p.remember(p.session.finish(err))
-		}
 	}
 	p.settled = true
 	return p.remember(p.session.finish(nil))

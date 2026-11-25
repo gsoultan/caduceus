@@ -34,6 +34,7 @@ func (c *Conn) startCopyBoth(sql string) error {
 		}
 		switch kind {
 		case MsgCopyBothResponse:
+			c.mark.forgo()
 			return nil
 		case MsgErrorResponse:
 			if failure == nil {

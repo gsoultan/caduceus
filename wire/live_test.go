@@ -131,6 +131,19 @@ func TestLiveReadBufferGrowsForAStreamAndShrinksBack(t *testing.T) {
 	if len(conn.rbuf) <= initialReadBuffer || len(conn.rbuf) > streamReadBuffer {
 		t.Fatalf("buffer after a megabyte of rows = %d, want it grown, and to at most %d", len(conn.rbuf), streamReadBuffer)
 	}
+	// A few short exchanges do not give it back. It used to go after one, and
+	// the windows of a pipeline, which fill the buffer every other time, had
+	// it freed and grown again for each: 22 MiB of garbage for a million
+	// statements.
+	grown := len(conn.rbuf)
+	for range calmExchanges - 1 {
+		if _, err := conn.QueryText(t.Context(), "SELECT 1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(conn.rbuf) != grown {
+		t.Fatalf("buffer after %d short exchanges = %d, want it kept at %d", calmExchanges-1, len(conn.rbuf), grown)
+	}
 	for range 2 {
 		if _, err := conn.QueryText(t.Context(), "SELECT 1"); err != nil {
 			t.Fatal(err)

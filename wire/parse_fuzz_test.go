@@ -12,7 +12,12 @@ func FuzzParseBackendMessages(f *testing.F) {
 	f.Add([]byte{0, 2, 0, 0, 0, 1, '7', 0xff, 0xff, 0xff, 0xff})
 	f.Add([]byte{'S', 'E', 'R', 'R', 'O', 'R', 0, 'C', '4', '2', 'P', '0', '1', 0, 0})
 	f.Fuzz(func(t *testing.T, body []byte) {
-		_, _ = ParseRowDescription(nil, body)
+		// What parses as a description is the same as itself, and comparing
+		// it with something else is no more to be trusted with it.
+		if fields, err := ParseRowDescription(nil, body); err == nil && !SameRowDescription(fields, body) {
+			t.Errorf("a description of %d columns was not the same as itself", len(fields))
+		}
+		_ = SameRowDescription([]Field{{Name: "id", DataTypeOID: 23}}, body)
 		_, _ = ParseParameterDescription(nil, body)
 		_, _ = SplitDataRow(nil, body)
 		_ = ParseError(body).Error()

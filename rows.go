@@ -3,6 +3,7 @@
 package caduceus
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/gsoultan/caduceus/codec"
@@ -31,6 +32,14 @@ type Rows struct {
 	ended   bool
 	settled bool
 	closed  bool
+	// started is set once anything of the result has been read, and ahead
+	// while values hold a row that Fields read before Next asked for it.
+	// bound is the statement's BindComplete read: an error from then on is
+	// the statement's own failure, and says nothing of what is remembered of
+	// it.
+	started bool
+	ahead   bool
+	bound   bool
 
 	// inline holds the values of a narrow row, saving their slice an
 	// allocation of its own.
@@ -46,44 +55,71 @@ func (c *Rows) init(s *Conn, stmt *statement, inBatch bool) {
 	}
 }
 
+// A read of the result stops at the next row, at the result's description,
+// or only at its end, with every row on the way skipped undecoded.
+type readTo uint8
+
+const (
+	toRow readTo = iota
+	toDescription
+	toEnd
+)
+
 // Next advances to the next row.
 func (c *Rows) Next() bool {
+	if c.ahead {
+		c.ahead = false
+		return true
+	}
 	c.values = c.values[:0]
 	if c.ended || c.closed {
 		return false
 	}
+	return c.read(toRow)
+}
+
+// read reads the result as far as stop says, or to its end, and reports
+// whether it stopped at a row.
+func (c *Rows) read(stop readTo) bool {
+	c.started = true
 	for {
-		kind, body, err := c.session.conn.Receive()
+		kind, body, err := c.session.receive()
 		if err != nil {
 			c.fail(err)
 			return false
 		}
 		switch kind {
 		case wire.MsgDataRow:
-			if c.values, err = wire.SplitDataRow(c.values[:0], body); err != nil || len(c.values) != len(c.stmt.fields) {
-				c.fail(wire.ErrProtocol)
+			if stop != toEnd {
+				return c.row(body)
+			}
+		case wire.MsgRowDescription, wire.MsgNoData:
+			// A statement that is not kept on the server was parsed again for
+			// this result, and this is what the server makes of it now.
+			if !describes(c.stmt, kind, body) && !c.redescribe(kind, body) {
 				return false
 			}
-			return true
+			if stop == toDescription {
+				return false
+			}
+		case wire.MsgBindComplete:
+			c.bound = true
 		case wire.MsgCommandComplete:
 			c.tag = c.session.tag(body)
-			if c.inBatch && !c.ownSync {
-				c.ended = true
+			if c.over() {
 				return false
 			}
 		case wire.MsgEmptyQueryResponse:
-			if c.inBatch && !c.ownSync {
-				c.ended = true
+			if c.over() {
 				return false
 			}
 		case wire.MsgErrorResponse:
 			if c.err == nil {
-				c.err = c.session.serverError(c.stmt, body)
+				c.err = c.session.serverError(c.stmt, body, c.bound)
 			}
-			if c.inBatch && !c.ownSync {
-				// The server skips everything up to the batch's Sync, so the
-				// statements after this one have no replies of their own.
-				c.ended = true
+			// In a batch the server skips everything up to the batch's Sync,
+			// so the statements after this one have no replies of their own.
+			if c.over() {
 				return false
 			}
 		case wire.MsgReadyForQuery:
@@ -97,6 +133,50 @@ func (c *Rows) Next() bool {
 	}
 }
 
+// row takes a DataRow as the current row, and reports whether it is one of
+// this result's. One that is not, malformed, or with another number of
+// columns than the statement was described with, as when a pooler has
+// prepared it again where a table has changed, means the stream no longer
+// says what it should, and the connection is closed.
+func (c *Rows) row(body []byte) bool {
+	var err error
+	if c.values, err = wire.SplitDataRow(c.values[:0], body); err == nil && len(c.values) == len(c.stmt.fields) {
+		return true
+	}
+	c.values = c.values[:0]
+	c.fail(c.session.broken())
+	return false
+}
+
+// over ends a statement of a batch at its last reply, a CommandComplete or an
+// error, and reports whether it did. A lone statement, and one of a pipeline,
+// which has a Sync of its own, run on to ReadyForQuery.
+func (c *Rows) over() bool {
+	c.ended = c.inBatch && !c.ownSync
+	return c.ended
+}
+
+// redescribe takes up the columns the server has just described, which are not
+// the ones remembered: a table was altered since, or another schema is first
+// on the search path. The result was asked for in the formats that suited the
+// columns remembered, so it is read as those formats of the types it turns out
+// to have, and a column whose type cannot be read in the format it comes in is
+// refused when it is scanned, with ErrResultChanged. What was remembered is
+// dropped, so the next execution asks afresh and gets formats that suit.
+func (c *Rows) redescribe(kind byte, body []byte) bool {
+	var fields []wire.Field
+	if kind == wire.MsgRowDescription {
+		var err error
+		if fields, err = wire.ParseRowDescription(nil, body); err != nil {
+			c.fail(err)
+			return false
+		}
+	}
+	c.session.cache.remove(c.stmt)
+	c.stmt = c.stmt.restated(fields)
+	return true
+}
+
 // settle ends the exchange when the cursor saw its ReadyForQuery.
 func (c *Rows) settle(err error) {
 	c.ended, c.settled = true, true
@@ -105,16 +185,16 @@ func (c *Rows) settle(err error) {
 	}
 }
 
+// fail ends the exchange on an error of the connection. What is kept is what
+// finish makes of it: for a read cut short by the context, an error that says
+// so, where the read's own says only that it timed out.
 func (c *Rows) fail(err error) {
-	if c.err == nil {
-		c.err = err
-	}
 	c.settle(err)
 }
 
 // Scan decodes the current row into dest.
 func (c *Rows) Scan(dest ...any) error {
-	if len(c.values) == 0 && len(c.stmt.fields) > 0 {
+	if c.ahead || (len(c.values) == 0 && len(c.stmt.fields) > 0) {
 		return ErrNotOnARow
 	}
 	if len(dest) != len(c.values) {
@@ -126,31 +206,68 @@ func (c *Rows) Scan(dest ...any) error {
 			continue
 		}
 		if err := codec.Scan(field.DataTypeOID, field.Format, value, dest[i]); err != nil {
-			return fmt.Errorf("caduceus: column %q: %w", field.Name, err)
+			return columnError(field, err)
 		}
 	}
 	return nil
 }
 
+// columnError says which column could not be scanned, and, for one that
+// arrived in a format chosen for the type it had when the statement was
+// described, that the statement's result changed since then: the statement
+// ran, and its column is not one that can be read in that format.
+func columnError(field *wire.Field, err error) error {
+	var unreadable *codec.TypeError
+	if field.Format != codec.ResultFormat(field.DataTypeOID) && errors.As(err, &unreadable) {
+		return fmt.Errorf("caduceus: column %q: %w: %w", field.Name, ErrResultChanged, err)
+	}
+	return fmt.Errorf("caduceus: column %q: %w", field.Name, err)
+}
+
 // Err returns the error that ended the result, if any.
 func (c *Rows) Err() error { return c.err }
 
-// Close reads whatever is left of the result, so the connection is back at a
-// boundary. It is idempotent.
+// Close reads whatever is left of the result, skipping its rows undecoded, so
+// the connection is back at a boundary. It is idempotent.
 func (c *Rows) Close() {
 	if c.closed {
 		return
 	}
-	for c.Next() {
+	c.ahead, c.values = false, c.values[:0]
+	if !c.ended {
+		c.read(toEnd)
 	}
 	c.closed = true
 }
 
 // Fields describes the result's columns, with the format each arrived in.
-func (c *Rows) Fields() []wire.Field { return c.stmt.fields }
+//
+// On a connection that keeps no statements on the server, the server describes
+// a statement afresh in front of its rows, and the columns are the ones it
+// describes, which differ from those remembered if the statement has come to
+// mean something else. Asked for before the first Next, Fields reads as far as
+// that description, which is already on its way and costs no round trip, and
+// keeps any row it finds behind it for Next.
+func (c *Rows) Fields() []wire.Field {
+	if c.unread() {
+		c.ahead = c.read(toDescription)
+	}
+	return c.stmt.fields
+}
+
+// unread reports whether nothing of the result has been read yet, of a
+// statement that the server describes again in front of its rows.
+func (c *Rows) unread() bool {
+	return !c.started && !c.ended && !c.closed && c.stmt.name == ""
+}
 
 // RawValues returns the current row's undecoded values.
-func (c *Rows) RawValues() [][]byte { return c.values }
+func (c *Rows) RawValues() [][]byte {
+	if c.ahead {
+		return nil
+	}
+	return c.values
+}
 
 // Tag returns the command tag, available once the result is over.
 func (c *Rows) Tag() string { return c.tag }

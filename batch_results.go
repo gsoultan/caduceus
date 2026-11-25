@@ -14,9 +14,11 @@ var errBatchExhausted = errors.New("caduceus: no more results in the batch")
 // BatchResults reads a pipelined batch's replies off the connection, one
 // statement at a time, in the order they were queued.
 type BatchResults struct {
-	session   *Conn
-	stmts     []*statement
-	temporary []string
+	session *Conn
+	// stmts holds a statement for each of the count queries, or one for all
+	// of them when they share their text.
+	stmts []*statement
+	count int
 
 	// pending is a batch too large to send at once, and windows the parts it
 	// goes in, of which sent have gone and written bytes with them. A batch
@@ -46,6 +48,21 @@ func (b *BatchResults) sendWindow() error {
 // unsent reports whether part of the batch has yet to be sent.
 func (b *BatchResults) unsent() bool { return b.sent < len(b.windows) }
 
+// due reports whether the next window is to be sent before the statement at
+// next is read. Reading the first statement of the last window sent is the
+// moment, which keeps the server supplied and never has more than two windows
+// unread by it. A window that begins with a statement too large to share one
+// waits until every statement before it has been read.
+func (b *BatchResults) due() bool {
+	if !b.unsent() {
+		return false
+	}
+	if window := b.windows[b.sent]; window.alone {
+		return b.next >= window.first
+	}
+	return b.next >= b.windows[b.sent-1].first
+}
+
 // statement returns a cursor over the next statement's result, closing the
 // previous one first so the connection is positioned at its start.
 func (b *BatchResults) statement() (*Rows, error) {
@@ -70,20 +87,17 @@ func (b *BatchResults) statementInto(rows *Rows) error {
 		}
 		return errBatchExhausted
 	}
-	if b.next >= len(b.stmts) {
+	if b.next >= b.count {
 		return errBatchExhausted
 	}
-	// Reading the first statement of the last window sent is the moment to
-	// send the next, which keeps the server supplied and never has more than
-	// two windows unread by it.
-	if b.unsent() && b.next >= b.windows[b.sent-1].first {
+	if b.due() {
 		if err := b.sendWindow(); err != nil {
 			b.settled = true
 			return b.remember(b.session.finish(err))
 		}
 	}
 	*rows = Rows{}
-	rows.init(b.session, b.stmts[b.next], true)
+	rows.init(b.session, statementAt(b.stmts, b.next), true)
 	b.current = rows
 	b.next++
 	return nil
@@ -106,13 +120,17 @@ func (b *BatchResults) note(c *Rows) {
 	if c.settled {
 		b.settled = true
 	}
+	// The server described the statement differently from how it was
+	// remembered. The queries after this one that share its Parse have no
+	// description of their own to learn that from.
+	restate(b.stmts, statementAt(b.stmts, b.next-1), c.stmt)
 }
 
 // close reads every remaining reply up to the batch's ReadyForQuery and
 // returns the batch's first error.
 func (b *BatchResults) close() error {
 	b.finishCurrent()
-	b.readUnsent()
+	b.readRest()
 	if b.settled {
 		return b.failure
 	}
@@ -120,7 +138,7 @@ func (b *BatchResults) close() error {
 		b.abandon()
 	}
 	for {
-		kind, body, err := b.session.conn.Receive()
+		kind, body, err := b.session.receive()
 		if err != nil {
 			b.settled = true
 			return b.remember(b.session.finish(err))
@@ -135,15 +153,22 @@ func (b *BatchResults) close() error {
 	}
 }
 
-// readUnsent reads results, which sends the windows behind them, until the
-// whole batch has been sent or a statement has failed. What is left then is
-// replies alone, which close reads without telling them apart.
-func (b *BatchResults) readUnsent() {
-	if !b.unsent() {
+// readRest reads the result of every statement not read yet, which sends the
+// windows behind them, until one has failed. The server runs nothing after a
+// failure, up to the Sync, so all that is left then is the error and the
+// ReadyForQuery, which close reads.
+//
+// Read as results, a statement's columns are still held to what was
+// remembered of it, and its errors are still told apart. Read as replies
+// alone, as the last window of a batch used to be, a batch closed without its
+// results read never dropped a description the server said no longer held,
+// and failed again on every attempt.
+func (b *BatchResults) readRest() {
+	if !b.unread() {
 		return
 	}
 	rows := new(Rows)
-	for b.unsent() && b.failure == nil && !b.settled {
+	for b.unread() {
 		if b.statementInto(rows) != nil {
 			return
 		}
@@ -151,14 +176,15 @@ func (b *BatchResults) readUnsent() {
 	}
 }
 
+// unread reports whether a statement's result is still to be read.
+func (b *BatchResults) unread() bool {
+	return b.next < b.count && b.failure == nil && !b.settled
+}
+
 // abandon ends a batch a statement of which failed. The server is skipping
 // everything up to a Sync, so if the batch's own has not been sent, in its
-// last window, one is sent in its place and the rest never goes. The batch's
-// own statements were to be closed ahead of that Sync, and were skipped with
-// the rest, so they are queued to be closed with the next exchange.
+// last window, one is sent in its place and the rest never goes.
 func (b *BatchResults) abandon() {
-	b.session.closing = append(b.session.closing, b.temporary...)
-	b.temporary = nil
 	if !b.unsent() {
 		return
 	}

@@ -49,7 +49,9 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 	}
 	list := strings.Join(columns, ", ")
 
-	own := s.conn.TxStatus() == wire.TxIdle
+	// A transaction begun and not yet sent is the caller's as much as one the
+	// server already knows of: its BEGIN goes with the describe.
+	own := s.txStatus() == wire.TxIdle
 	oids, err := s.describeColumns("SELECT "+list+" FROM "+table, own)
 	if err != nil {
 		return 0, err
@@ -67,15 +69,18 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 
 // describeColumns returns the types of a query's columns, first beginning a
 // transaction if own is set. If the describe fails, that transaction is rolled
-// back before the failure is returned.
+// back before the failure is returned. Without own, the BEGIN of a caller's
+// transaction that is still waiting goes in front, inside the describe's Sync,
+// so the server refusing it fails the describe and nothing is copied.
 func (s *Conn) describeColumns(sql string, own bool) ([]uint32, error) {
 	buf := s.conn.Buffer()
 	if own {
 		buf = wire.AppendQuery(buf, "BEGIN")
 	}
-	buf = s.closeEvicted(buf)
+	buf = s.appendBegin(s.closeEvicted(buf))
 	buf = wire.AppendParse(buf, "", sql, nil)
 	buf = wire.AppendDescribe(buf, 'S', "")
+	s.began()
 	if err := s.conn.Send(wire.AppendSync(buf)); err != nil {
 		return nil, err
 	}
