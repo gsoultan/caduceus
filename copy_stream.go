@@ -16,25 +16,32 @@ const copyChunk = 64 << 10
 // header extension.
 const copySignature = "PGCOPY\n\377\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 
-// unbound is the statement a COPY is bound as: no parameters and no result.
-var unbound = &statement{}
-
 // copyStream encodes the rows of one CopyFrom and sends them in chunks.
 //
 // It writes COPY's binary format, which the server reads without parsing, for
 // as long as every value has a binary form. At the first that does not — a
 // string for an integer column, which only the server's input function can
 // read — it ends that COPY and continues in a second, in text format. Both run
-// before the one Sync that follows them, so they succeed or fail together.
+// in one transaction, so they succeed or fail together.
 type copyStream struct {
 	session *Conn
 	target  string
 	oids    []uint32
-	binary  bool
+	// own is a COPY outside any transaction, which runs in one of its own:
+	// begun before the columns were described, committed behind the rows.
+	own    bool
+	binary bool
+
 	buf     []byte
 	mark    int
 	scratch []byte
 	written int64
+
+	// statements is how many COPY statements have been begun, one or two,
+	// and unsent how many of those are still in buf. Each one sent is answered
+	// with a ReadyForQuery of its own.
+	statements int
+	unsent     int
 }
 
 // open starts the stream in binary if every column's type allows it. Nothing is
@@ -64,10 +71,8 @@ func (c *copyStream) begin() {
 	if c.binary {
 		sql += " (FORMAT binary)"
 	}
-	buf := wire.AppendParse(c.buf, "", sql, nil)
-	buf, _ = appendBind(buf, unbound, nil)
-	buf = wire.AppendExecute(buf, "", 0)
-	c.buf, c.mark = wire.StartMessage(buf, 'd')
+	c.statements, c.unsent = c.statements+1, c.unsent+1
+	c.buf, c.mark = wire.StartMessage(wire.AppendQuery(c.buf, sql), 'd')
 	if c.binary {
 		c.buf = append(c.buf, copySignature...)
 	}
@@ -107,6 +112,7 @@ func (c *copyStream) write(values []any) error {
 	if err := c.session.conn.Send(wire.FinishMessage(c.buf, c.mark)); err != nil {
 		return err
 	}
+	c.unsent = 0
 	c.buf, c.mark = wire.StartMessage(c.session.conn.Buffer(), 'd')
 	return nil
 }
@@ -132,7 +138,7 @@ func (c *copyStream) encode(values []any) error {
 // sent, and is simply replaced.
 func (c *copyStream) toText() {
 	if c.written == 0 {
-		c.buf = c.buf[:0]
+		c.buf, c.statements, c.unsent = c.buf[:0], 0, 0
 	} else {
 		c.end()
 	}
@@ -140,10 +146,79 @@ func (c *copyStream) toText() {
 	c.begin()
 }
 
-// finish ends the COPY and sends what is left, with the Sync that commits it.
+// finish ends the COPY and sends what is left, with the COMMIT of a
+// transaction the COPY began for itself. The COMMIT is sent without waiting to
+// see whether the COPY succeeded: in a transaction that has failed, the server
+// treats it as the ROLLBACK that is wanted then.
 func (c *copyStream) finish() error {
 	c.end()
-	return c.session.conn.Send(wire.AppendSync(c.buf))
+	if c.own {
+		c.buf = wire.AppendQuery(c.buf, "COMMIT")
+	}
+	c.unsent = 0
+	return c.session.conn.Send(c.buf)
+}
+
+// result reads the reply to every statement of a finished stream and returns
+// how many rows the COPY took, summed over both parts of one that changed
+// format. The first error is the one that matters: after it the server
+// refuses a second COPY only because the first failed.
+func (c *copyStream) result() (int64, error) {
+	var total int64
+	var failure error
+	for owed := c.owed(); owed > 0; owed-- {
+		tag, err := c.session.drain(nil)
+		if err != nil && !isServerError(err) {
+			return 0, err
+		}
+		if failure == nil {
+			failure = err
+		}
+		total += copyCount(tag)
+	}
+	if failure != nil {
+		return 0, failure
+	}
+	return total, nil
+}
+
+// owed is how many ReadyForQuery messages the server owes for what has been
+// sent: one for each COPY statement, and one for the COMMIT or ROLLBACK that
+// ends a transaction of the stream's own.
+func (c *copyStream) owed() int {
+	owed := c.statements - c.unsent
+	if c.own {
+		owed++
+	}
+	return owed
+}
+
+// abandon gives up a stream whose source failed, and returns why. What is
+// still in the buffer is never sent. CopyFail aborts a COPY the server has
+// started, and a transaction of the stream's own is rolled back, so nothing
+// of the copy is kept; inside the caller's transaction the aborted COPY has
+// failed that transaction, which is what undoes the rows there.
+func (c *copyStream) abandon(reason error) error {
+	buf := c.session.conn.Buffer()
+	if c.statements > c.unsent {
+		buf = wire.AppendCopyFail(buf, "caduceus: copy abandoned")
+	}
+	if c.own {
+		buf = wire.AppendQuery(buf, "ROLLBACK")
+	}
+	owed := c.owed()
+	if owed == 0 {
+		return reason
+	}
+	if err := c.session.conn.Send(buf); err != nil {
+		return err
+	}
+	for ; owed > 0; owed-- {
+		if _, err := c.session.drain(nil); err != nil && !isServerError(err) {
+			return err
+		}
+	}
+	return reason
 }
 
 // appendCopyTuple appends one row of COPY binary format: the number of fields,

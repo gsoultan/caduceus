@@ -35,7 +35,7 @@ func TestAppendCopyTupleReportsWhatHasNoBinaryForm(t *testing.T) {
 }
 
 // messages lists the type bytes of the frontend messages in buf, with the SQL
-// of each Parse, which is enough to see what a stream would send.
+// of each Query, which is enough to see what a stream would send.
 func messages(t *testing.T, buf []byte) []string {
 	t.Helper()
 	var out []string
@@ -46,8 +46,8 @@ func messages(t *testing.T, buf []byte) []string {
 		size := int(buf[1])<<24 | int(buf[2])<<16 | int(buf[3])<<8 | int(buf[4])
 		body := buf[5 : 1+size]
 		name := string(buf[0])
-		if buf[0] == 'P' {
-			name += " " + string(body[1:bytes.IndexByte(body[1:], 0)+1])
+		if buf[0] == 'Q' {
+			name += " " + string(body[:len(body)-1])
 		}
 		out = append(out, name)
 		buf = buf[1+size:]
@@ -76,7 +76,7 @@ func TestCopyStreamStaysBinaryForNativeValues(t *testing.T) {
 	stream := streamOf(codec.Int8, codec.Text)
 	encodeAll(t, stream, []any{int64(1), "a"}, []any{nil, "b"})
 	got := strings.Join(messages(t, stream.buf), " | ")
-	if want := "P COPY t (a, b) FROM STDIN (FORMAT binary) | B | E | d | c"; got != want {
+	if want := "Q COPY t (a, b) FROM STDIN (FORMAT binary) | d | c"; got != want {
 		t.Fatalf("stream sent %q\nwant %q", got, want)
 	}
 }
@@ -87,7 +87,7 @@ func TestCopyStreamIsTextForATypeWithoutBinary(t *testing.T) {
 	stream := streamOf(codec.Int8, codec.Numeric)
 	encodeAll(t, stream, []any{int64(1), "1.50"})
 	got := strings.Join(messages(t, stream.buf), " | ")
-	if want := "P COPY t (a, b) FROM STDIN | B | E | d | c"; got != want {
+	if want := "Q COPY t (a, b) FROM STDIN | d | c"; got != want {
 		t.Fatalf("stream sent %q\nwant %q", got, want)
 	}
 }
@@ -98,7 +98,7 @@ func TestCopyStreamReplacesAnUnusedBinaryCopy(t *testing.T) {
 	stream := streamOf(codec.Int8, codec.Text)
 	encodeAll(t, stream, []any{"1", "a"}, []any{"2", "b"})
 	got := strings.Join(messages(t, stream.buf), " | ")
-	if want := "P COPY t (a, b) FROM STDIN | B | E | d | c"; got != want {
+	if want := "Q COPY t (a, b) FROM STDIN | d | c"; got != want {
 		t.Fatalf("stream sent %q\nwant %q", got, want)
 	}
 }
@@ -111,7 +111,7 @@ func TestCopyStreamChangesToTextMidStream(t *testing.T) {
 	stream := streamOf(codec.Int8, codec.Text)
 	encodeAll(t, stream, []any{int64(1), "a"}, []any{"2", "b"}, []any{int64(3), "c"})
 	got := strings.Join(messages(t, stream.buf), " | ")
-	want := "P COPY t (a, b) FROM STDIN (FORMAT binary) | B | E | d | c | P COPY t (a, b) FROM STDIN | B | E | d | c"
+	want := "Q COPY t (a, b) FROM STDIN (FORMAT binary) | d | c | Q COPY t (a, b) FROM STDIN | d | c"
 	if got != want {
 		t.Fatalf("stream sent %q\nwant %q", got, want)
 	}
@@ -128,8 +128,45 @@ func TestCopyStreamEmptySource(t *testing.T) {
 	}
 	text := streamOf(codec.Numeric)
 	encodeAll(t, text)
-	if got, want := strings.Join(messages(t, text.buf), " | "), "P COPY t (a, b) FROM STDIN | B | E | c"; got != want {
+	if got, want := strings.Join(messages(t, text.buf), " | "), "Q COPY t (a, b) FROM STDIN | c"; got != want {
 		t.Fatalf("empty text stream sent %q, want %q", got, want)
+	}
+}
+
+// Every statement sent is answered with a ReadyForQuery, and reading one too
+// few or one too many leaves the connection out of step with the server. A
+// statement still in the buffer has no answer coming; a transaction of the
+// stream's own has one more, for the COMMIT or ROLLBACK that ends it.
+func TestCopyStreamCountsTheRepliesItIsOwed(t *testing.T) {
+	stream := streamOf(codec.Int8, codec.Text)
+	if got := stream.owed(); got != 0 {
+		t.Fatalf("owed = %d before anything is sent, want 0", got)
+	}
+	stream.own = true
+	if got := stream.owed(); got != 1 {
+		t.Fatalf("owed = %d for an unsent COPY in its own transaction, want 1", got)
+	}
+	stream.unsent = 0 // as a flush leaves it
+	for _, row := range [][]any{{int64(1), "a"}, {"2", "b"}} {
+		if err := stream.encode(row); err != nil {
+			t.Fatal(err)
+		}
+		stream.written++
+	}
+	if stream.statements != 2 || stream.owed() != 2 {
+		t.Fatalf("statements = %d, owed = %d with the second COPY unsent, want 2 and 2", stream.statements, stream.owed())
+	}
+	stream.unsent = 0
+	if got := stream.owed(); got != 3 {
+		t.Fatalf("owed = %d once both are sent, want 3", got)
+	}
+
+	replaced := streamOf(codec.Int8, codec.Text)
+	if err := replaced.encode([]any{"1", "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if replaced.statements != 1 || replaced.unsent != 1 {
+		t.Fatalf("a replaced binary COPY left statements = %d, unsent = %d, want 1 and 1", replaced.statements, replaced.unsent)
 	}
 }
 

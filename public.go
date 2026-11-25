@@ -99,9 +99,13 @@ func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, e
 // timestamptz, interval, json and jsonb. With any other column they go in text.
 //
 // A value only the server can read, such as a string for an integer column, is
-// not refused. From that row on the rows go in text, as a second COPY run
-// before the first is committed, so the rows are still copied all or none;
+// not refused. From that row on the rows go in text, as a second COPY in the
+// same transaction as the first, so the rows are still copied all or none;
 // statement-level triggers and constraint checks run once for each of the two.
+//
+// Outside a transaction CopyFrom begins one of its own and commits it behind
+// the rows, or rolls it back if the copy fails. Inside one it is part of the
+// caller's, and a copy that fails leaves that transaction failed.
 func (s *Conn) CopyFrom(ctx context.Context, table, columns []string, rows CopySource) (int64, error) {
 	return s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
 }

@@ -15,8 +15,21 @@ import (
 //
 // It takes two round trips whatever the number of rows. The first learns the
 // column types, from a Parse and Describe of a SELECT over the columns. The
-// second carries the COPY command, the rows and the Sync that ends it; the rows
-// are encoded for the described types as they are pulled from the source.
+// second carries the COPY command, the rows, and what ends them; the rows are
+// encoded for the described types as they are pulled from the source.
+//
+// Outside a transaction it runs in one of its own, begun before the describe
+// and committed behind the rows. That does two things. The lock Parse takes on
+// the table is held until the COPY has run, so the types described are the
+// types written to: a column cannot be altered in between, which matters once
+// values are sent in binary, where four bytes meant as an int4 would be read
+// as whatever the column had become. And a COPY that changes format part way,
+// which is two COPY statements, is still all or nothing. Inside a transaction
+// the caller's does both.
+//
+// COPY itself is sent as a simple Query, as libpq and every other driver send
+// it. The extended protocol would save the transaction, but poolers have had
+// defects following a COPY through it.
 func (s *Conn) copyFrom(ctx context.Context, request copyRequest) (int64, error) {
 	if request.Rows == nil {
 		return 0, ErrNoCopySource
@@ -36,60 +49,76 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 	}
 	list := strings.Join(columns, ", ")
 
-	oids, err := s.describeColumns("SELECT " + list + " FROM " + table)
+	own := s.conn.TxStatus() == wire.TxIdle
+	oids, err := s.describeColumns("SELECT "+list+" FROM "+table, own)
 	if err != nil {
 		return 0, err
 	}
-	stream := copyStream{session: s, target: table + " (" + list + ")", oids: oids}
+	stream := copyStream{session: s, target: table + " (" + list + ")", oids: oids, own: own}
 	stream.open()
 	if err := sendRows(&stream, request.Rows); err != nil {
-		return 0, s.abandonCopy(err)
+		return 0, stream.abandon(err)
 	}
 	if err := stream.finish(); err != nil {
 		return 0, err
 	}
-	return s.copied()
+	return stream.result()
 }
 
-// describeColumns returns the types of a query's columns.
-//
-// It ends with a Flush, not a Sync, which leaves the implicit transaction open
-// and with it the lock Parse took on the table. The types described are then
-// the types written to: a column cannot be altered between this and the COPY,
-// which matters once values are sent in binary, where four bytes meant as an
-// int4 would be read as whatever the column had become. The caller owes the
-// server a Sync.
-func (s *Conn) describeColumns(sql string) ([]uint32, error) {
-	buf := s.closeEvicted(s.conn.Buffer())
+// describeColumns returns the types of a query's columns, first beginning a
+// transaction if own is set. If the describe fails, that transaction is rolled
+// back before the failure is returned.
+func (s *Conn) describeColumns(sql string, own bool) ([]uint32, error) {
+	buf := s.conn.Buffer()
+	if own {
+		buf = wire.AppendQuery(buf, "BEGIN")
+	}
+	buf = s.closeEvicted(buf)
 	buf = wire.AppendParse(buf, "", sql, nil)
 	buf = wire.AppendDescribe(buf, 'S', "")
-	if err := s.conn.Send(wire.AppendFlush(buf)); err != nil {
+	if err := s.conn.Send(wire.AppendSync(buf)); err != nil {
 		return nil, err
 	}
-	for {
-		kind, body, err := s.conn.Receive()
-		if err != nil {
-			return nil, err
-		}
-		switch kind {
-		case wire.MsgRowDescription:
-			return s.columnTypes(body)
-		case wire.MsgErrorResponse:
-			return nil, s.settle(wire.ParseError(body))
+	var began error
+	if own {
+		if _, began = s.drain(nil); began != nil && !isServerError(began) {
+			return nil, began
 		}
 	}
+	described, err := s.readDescription("", "")
+	if err == nil && began == nil {
+		return columnTypes(described), nil
+	}
+	if err != nil && !isServerError(err) {
+		return nil, err
+	}
+	if own {
+		if rollback := s.rollbackOwn(); rollback != nil {
+			return nil, rollback
+		}
+	}
+	return nil, errors.Join(began, err)
 }
 
-func (s *Conn) columnTypes(description []byte) ([]uint32, error) {
-	fields, err := wire.ParseRowDescription(nil, description)
-	if err != nil {
-		return nil, s.settle(err)
-	}
-	oids := make([]uint32, len(fields))
-	for i, field := range fields {
+func columnTypes(described *statement) []uint32 {
+	oids := make([]uint32, len(described.fields))
+	for i, field := range described.fields {
 		oids[i] = field.DataTypeOID
 	}
-	return oids, nil
+	return oids
+}
+
+// rollbackOwn ends the transaction a COPY began for itself. It returns only a
+// failure of the connection; a server's complaint about the ROLLBACK changes
+// nothing about what the caller is told.
+func (s *Conn) rollbackOwn() error {
+	if err := s.conn.Send(wire.AppendQuery(s.conn.Buffer(), "ROLLBACK")); err != nil {
+		return err
+	}
+	if _, err := s.drain(nil); err != nil && !isServerError(err) {
+		return err
+	}
+	return nil
 }
 
 // sendRows writes every row of the source to the stream.
@@ -104,58 +133,6 @@ func sendRows(stream *copyStream, rows CopySource) error {
 		}
 	}
 	return rows.Err()
-}
-
-// copied reads the replies to a COPY through to ReadyForQuery and returns how
-// many rows it took, summed over both parts of one that changed format.
-func (s *Conn) copied() (int64, error) {
-	var total int64
-	var failure error
-	for {
-		kind, body, err := s.conn.Receive()
-		if err != nil {
-			return 0, err
-		}
-		switch kind {
-		case wire.MsgCommandComplete:
-			total += copyCount(s.tag(body))
-		case wire.MsgErrorResponse:
-			if failure == nil {
-				failure = wire.ParseError(body)
-			}
-		case wire.MsgReadyForQuery:
-			if failure != nil {
-				return 0, failure
-			}
-			return total, nil
-		}
-	}
-}
-
-// abandonCopy gives up a COPY whose source failed and returns why. CopyFail
-// aborts a COPY the server has started, and is ignored by one that has not
-// heard of it yet; the Sync ends the transaction either way.
-func (s *Conn) abandonCopy(reason error) error {
-	buf := wire.AppendCopyFail(s.conn.Buffer(), "caduceus: copy abandoned")
-	if err := s.conn.Send(wire.AppendSync(buf)); err != nil {
-		return err
-	}
-	if _, err := s.drain(nil); err != nil && !isServerError(err) {
-		return err
-	}
-	return reason
-}
-
-// settle sends the Sync a failed exchange still owes, reads through to
-// ReadyForQuery, and returns the failure.
-func (s *Conn) settle(failure error) error {
-	if err := s.conn.Send(wire.AppendSync(s.conn.Buffer())); err != nil {
-		return err
-	}
-	if _, err := s.drain(nil); err != nil && !isServerError(err) {
-		return err
-	}
-	return failure
 }
 
 // copyCount reads the row count from a "COPY n" tag.

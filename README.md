@@ -88,7 +88,10 @@ n, err := conn.CopyFrom(ctx, []string{"public", "events"}, []string{"id", "kind"
 	caduceus.CopyFromRows([][]any{{1, "signup"}, {2, "login"}}))
 ```
 
-`CopyFrom` takes two round trips whatever the number of rows. The rows go in
+`CopyFrom` takes two round trips whatever the number of rows. Outside a
+transaction it runs in one of its own, so the copy is all or nothing and the
+column types it was encoded for cannot change under it; inside one it is part
+of yours. The rows go in
 COPY's binary format, which the server reads without parsing, when every column
 is an integer, float, bool, text, varchar, char, bytea, uuid, date, timestamp,
 timestamptz, interval, json or jsonb, and in text when any column is something
@@ -161,7 +164,7 @@ Wall time per operation:
 | 100 rows × 4 typed columns | **146 µs** | 229 µs | 217 µs | 307 µs |
 | BEGIN, INSERT, COMMIT | **147 µs** | 211 µs | 222 µs | 274 µs |
 | Batch of 10 selects | **76.3 µs** | 107 µs | 693 µs ¹ | 1.13 ms ¹ |
-| COPY 1,000 rows | **1.86 ms** | 2.10 ms | — ² | 2.75 ms ³ |
+| COPY 1,000 rows | **1.84 ms** | 2.13 ms | — ² | 2.54 ms ³ |
 | 1,000 inserts in one transaction | **3.09 ms** ⁴ | 4.76 ms ⁴ | 68 ms | 54 ms |
 | Decode a pgoutput UPDATE | **1.06 µs** | 1.86 µs (pglogrepl) | — | — |
 
@@ -175,7 +178,7 @@ benchmark output, the process's user and system time):
 | 100 rows × 4 typed columns | **64.6 µs** | 152 µs | 138 µs | 186 µs |
 | BEGIN, INSERT, COMMIT | **90.4 µs** | 165 µs | 197 µs | 209 µs |
 | Batch of 10 selects | **41.6 µs** | 84.5 µs | 591 µs | 700 µs |
-| COPY 1,000 rows | **242 µs** | 624 µs | — | 1.06 ms |
+| COPY 1,000 rows | **236 µs** | 622 µs | — | 1.01 ms |
 | 1,000 inserts in one transaction | **588 µs** | 2.63 ms | 55 ms | 34 ms |
 
 Memory allocated per operation:
@@ -186,7 +189,7 @@ Memory allocated per operation:
 | 100 rows × 4 typed columns | **1.9 KiB** · 105 | 11 KiB · 662 | 8.2 KiB · 525 | 12 KiB · 623 |
 | BEGIN, INSERT, COMMIT | **95 B** · 5 | 192 B · 6 | 725 B · 16 | 767 B · 17 |
 | Batch of 10 selects | **2.7 KiB** · 12 | 6.7 KiB · 161 | 7.3 KiB · 140 | 6.7 KiB · 160 |
-| COPY 1,000 rows | **0.5 KiB** · 15 | 114 KiB · 43 | — | 221 KiB · 4,027 |
+| COPY 1,000 rows | **0.7 KiB** · 22 | 114 KiB · 43 | — | 222 KiB · 4,027 |
 | 1,000 inserts in one transaction | **33 KiB** · 12 | 809 KiB · 9,037 | 252 KiB · 6,033 | 204 KiB · 7,014 |
 
 ¹ database/sql has no batch, so the ten queries run one after another.
@@ -204,7 +207,7 @@ seven passes on the same machine.
 | Workload | caduceus | pgx v5.10 | database/sql + pgx | lib/pq |
 | :--- | ---: | ---: | ---: | ---: |
 | Read 1M rows | 594 ms · **292 ms** · **15 MiB** | 679 ms · 641 ms · 106 MiB | 557 ms · 529 ms · 86 MiB | 789 ms · 790 ms · 125 MiB |
-| COPY 1M rows | **228 ms** · **48 ms** · **0.5 KiB** | 236 ms · 114 ms · 306 KiB | — | 353 ms · 447 ms · 153 MiB ³ |
+| COPY 1M rows | **214 ms** · **53 ms** · **0.7 KiB** | 240 ms · 116 ms · 305 KiB | — | 317 ms · 430 ms · 153 MiB ³ |
 | 1M inserts in one transaction | **2.68 s** · **0.44 s** · **30 MiB** ⁴ | 3.65 s · 2.26 s · 932 MiB ⁴ | 69.7 s · 57.9 s · 244 MiB | 47.1 s · 28.9 s · 206 MiB |
 
 Reading and copying a million rows take as long as the server takes to produce

@@ -546,6 +546,9 @@ func TestLiveCopyChangesFormatMidStream(t *testing.T) {
 	if err != nil || copied != 5 {
 		t.Fatalf("CopyFrom = %d, %v", copied, err)
 	}
+	if conn.TxStatus() != wire.TxIdle {
+		t.Fatalf("status = %c after a COPY outside a transaction, want idle", conn.TxStatus())
+	}
 	var sum int
 	if err := conn.QueryRow(ctx, "SELECT sum(id) FROM "+table).Scan(&sum); err != nil || sum != 15 {
 		t.Fatalf("sum(id) = %d, %v, want 15", sum, err)
@@ -712,6 +715,13 @@ func TestLiveCopyInATransaction(t *testing.T) {
 	}
 	if conn.TxStatus() != wire.TxFailed {
 		t.Fatalf("status = %c after a failed COPY in a transaction, want failed", conn.TxStatus())
+	}
+	// A COPY ends only a transaction it began. In the caller's failed one it is
+	// refused like any statement, and the transaction is left for the caller.
+	_, err = tx.CopyFrom(ctx, []string{name}, []string{"id", "note"}, CopyFromRows([][]any{{2, "c"}}))
+	var failure *wire.Error
+	if !errors.As(err, &failure) || failure.Code != "25P02" || conn.TxStatus() != wire.TxFailed {
+		t.Fatalf("CopyFrom in a failed transaction = %v, status %c", err, conn.TxStatus())
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
