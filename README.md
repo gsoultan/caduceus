@@ -112,6 +112,19 @@ runs on PostgreSQL 16.15 over loopback TCP, on a 4-vCPU 2.3 GHz Xeon, Go 1.26.5.
 | COPY 1,000 rows | **1.41 ms** · 0.5 KiB | 1.60 ms · 117 KiB | 67.5 ms ² |
 | Decode a pgoutput UPDATE (vs pglogrepl) | **855 ns** · 20 allocs | 1,469 ns · 48 allocs | — |
 
+Client CPU per operation, which leaves out the server's share of each round trip, from a
+later run on the same box (`cpu-ns/op` in the benchmark output):
+
+| Workload | caduceus | pgx v5.10 | database/sql |
+| :--- | ---: | ---: | ---: |
+| QueryRow | **33.8 µs** | 58.7 µs | 61.5 µs |
+| 100 rows × 4 typed columns | **73.1 µs** | 150.7 µs | 151.1 µs |
+| BEGIN, INSERT, COMMIT | **94.4 µs** | 167.7 µs | 212.5 µs |
+| Batch of 10 selects | **41.8 µs** | 87.4 µs | 576.1 µs |
+
+Profiled, about 80% of caduceus's client CPU is the kernel's `write` and `read` and the Go
+runtime waking for them; the driver's own code, decoding included, is under a fifth.
+
 ¹ database/sql has no batch, so the ten queries run one after another.
 ² database/sql has no COPY, so the rows are inserted with a prepared statement in one transaction.
 

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"os"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,13 +90,25 @@ func connections(b *testing.B) (*caduceus.Conn, *pgx.Conn, *sql.DB) {
 	return cad, px, db
 }
 
+// processCPU is the CPU time this process has used, user and system, in
+// nanoseconds.
+func processCPU() int64 {
+	var usage syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &usage)
+	return usage.Utime.Nano() + usage.Stime.Nano()
+}
+
 func runAll(b *testing.B, contenders []contender) {
 	for _, c := range contenders {
 		b.Run(c.name, func(b *testing.B) {
 			ctx := context.Background()
 			b.ReportAllocs()
 			b.ResetTimer()
+			start := processCPU()
 			c.run(b, ctx)
+			// Wall time includes the server's share of every round trip, which
+			// no driver can change. Client CPU per operation is the driver's own.
+			b.ReportMetric(float64(processCPU()-start)/float64(b.N), "cpu-ns/op")
 		})
 	}
 }
