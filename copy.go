@@ -8,23 +8,19 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gsoultan/caduceus/codec"
 	"github.com/gsoultan/caduceus/wire"
 )
 
-// copyChunk is how much row data is gathered before it goes out as CopyData.
-const copyChunk = 64 << 10
-
-// errCopyNotStarted is a server that answered COPY with something other than
-// CopyInResponse.
-var errCopyNotStarted = errors.New("caduceus: server did not start the COPY")
-
-// copyFrom streams rows into a table in COPY's text format.
+// copyFrom streams rows into a table with COPY.
 //
-// The column types are learned and the COPY started in the same round trip: a
-// Parse and Describe of a SELECT over the columns, then the COPY behind it. The
-// rows are then encoded for those types as they are pulled from the source.
+// It takes two round trips whatever the number of rows. The first learns the
+// column types, from a Parse and Describe of a SELECT over the columns. The
+// second carries the COPY command, the rows and the Sync that ends it; the rows
+// are encoded for the described types as they are pulled from the source.
 func (s *Conn) copyFrom(ctx context.Context, request copyRequest) (int64, error) {
+	if request.Rows == nil {
+		return 0, ErrNoCopySource
+	}
 	if err := s.begin(ctx); err != nil {
 		return 0, err
 	}
@@ -40,69 +36,108 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 	}
 	list := strings.Join(columns, ", ")
 
-	buf := s.closeEvicted(s.conn.Buffer())
-	buf = wire.AppendParse(buf, "", "SELECT "+list+" FROM "+table, nil)
-	buf = wire.AppendDescribe(buf, 'S', "")
-	buf = wire.AppendSync(buf)
-	buf = wire.AppendQuery(buf, "COPY "+table+" ("+list+") FROM STDIN")
-	if err := s.conn.Send(buf); err != nil {
-		return 0, err
-	}
-
-	// A failed describe is reported by the COPY as well, which still has to be
-	// read to its ReadyForQuery, so the COPY's error is the one returned.
-	described, describeErr := s.readDescription("", "")
-	if err := s.awaitCopyIn(); err != nil {
-		return 0, err
-	}
-	if describeErr != nil {
-		return 0, s.abandonCopy(describeErr)
-	}
-
-	oids := make([]uint32, len(described.fields))
-	for i, field := range described.fields {
-		oids[i] = field.DataTypeOID
-	}
-	if err := s.sendRows(request.Rows, oids); err != nil {
-		return 0, s.abandonCopy(err)
-	}
-	if err := s.conn.Send(wire.AppendCopyDone(s.conn.Buffer())); err != nil {
-		return 0, err
-	}
-	tag, err := s.drain(nil)
+	oids, err := s.describeColumns("SELECT " + list + " FROM " + table)
 	if err != nil {
 		return 0, err
 	}
-	return copyCount(tag), nil
+	stream := copyStream{session: s, target: table + " (" + list + ")", oids: oids}
+	stream.open()
+	if err := sendRows(&stream, request.Rows); err != nil {
+		return 0, s.abandonCopy(err)
+	}
+	if err := stream.finish(); err != nil {
+		return 0, err
+	}
+	return s.copied()
 }
 
-// awaitCopyIn reads up to the server's CopyInResponse. A server error before it
-// is read through to ReadyForQuery and returned.
-func (s *Conn) awaitCopyIn() error {
+// describeColumns returns the types of a query's columns.
+//
+// It ends with a Flush, not a Sync, which leaves the implicit transaction open
+// and with it the lock Parse took on the table. The types described are then
+// the types written to: a column cannot be altered between this and the COPY,
+// which matters once values are sent in binary, where four bytes meant as an
+// int4 would be read as whatever the column had become. The caller owes the
+// server a Sync.
+func (s *Conn) describeColumns(sql string) ([]uint32, error) {
+	buf := s.closeEvicted(s.conn.Buffer())
+	buf = wire.AppendParse(buf, "", sql, nil)
+	buf = wire.AppendDescribe(buf, 'S', "")
+	if err := s.conn.Send(wire.AppendFlush(buf)); err != nil {
+		return nil, err
+	}
 	for {
 		kind, body, err := s.conn.Receive()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		switch kind {
-		case wire.MsgCopyInResponse:
-			return nil
+		case wire.MsgRowDescription:
+			return s.columnTypes(body)
 		case wire.MsgErrorResponse:
-			failure := wire.ParseError(body)
-			if _, err := s.drain(nil); err != nil {
-				return err
-			}
-			return failure
-		case wire.MsgReadyForQuery:
-			return errCopyNotStarted
+			return nil, s.settle(wire.ParseError(body))
 		}
 	}
 }
 
-// abandonCopy ends a started COPY with CopyFail, reads the server's reply
-// through to ReadyForQuery, and returns why the copy was abandoned.
+func (s *Conn) columnTypes(description []byte) ([]uint32, error) {
+	fields, err := wire.ParseRowDescription(nil, description)
+	if err != nil {
+		return nil, s.settle(err)
+	}
+	oids := make([]uint32, len(fields))
+	for i, field := range fields {
+		oids[i] = field.DataTypeOID
+	}
+	return oids, nil
+}
+
+// sendRows writes every row of the source to the stream.
+func sendRows(stream *copyStream, rows CopySource) error {
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return err
+		}
+		if err := stream.write(values); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// copied reads the replies to a COPY through to ReadyForQuery and returns how
+// many rows it took, summed over both parts of one that changed format.
+func (s *Conn) copied() (int64, error) {
+	var total int64
+	var failure error
+	for {
+		kind, body, err := s.conn.Receive()
+		if err != nil {
+			return 0, err
+		}
+		switch kind {
+		case wire.MsgCommandComplete:
+			total += copyCount(s.tag(body))
+		case wire.MsgErrorResponse:
+			if failure == nil {
+				failure = wire.ParseError(body)
+			}
+		case wire.MsgReadyForQuery:
+			if failure != nil {
+				return 0, failure
+			}
+			return total, nil
+		}
+	}
+}
+
+// abandonCopy gives up a COPY whose source failed and returns why. CopyFail
+// aborts a COPY the server has started, and is ignored by one that has not
+// heard of it yet; the Sync ends the transaction either way.
 func (s *Conn) abandonCopy(reason error) error {
-	if err := s.conn.Send(wire.AppendCopyFail(s.conn.Buffer(), "caduceus: copy abandoned")); err != nil {
+	buf := wire.AppendCopyFail(s.conn.Buffer(), "caduceus: copy abandoned")
+	if err := s.conn.Send(wire.AppendSync(buf)); err != nil {
 		return err
 	}
 	if _, err := s.drain(nil); err != nil && !isServerError(err) {
@@ -111,75 +146,16 @@ func (s *Conn) abandonCopy(reason error) error {
 	return reason
 }
 
-// sendRows encodes every row from the source and sends them in chunks.
-func (s *Conn) sendRows(rows CopySource, oids []uint32) error {
-	buf, mark := wire.StartMessage(s.conn.Buffer(), 'd')
-	var scratch []byte
-	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			return err
-		}
-		if len(values) != len(oids) {
-			return &ArgumentCountError{Want: len(oids), Got: len(values)}
-		}
-		if buf, scratch, err = appendCopyLine(buf, scratch, oids, values); err != nil {
-			return err
-		}
-		if len(buf)-mark < copyChunk {
-			continue
-		}
-		if err := s.conn.Send(wire.FinishMessage(buf, mark)); err != nil {
-			return err
-		}
-		buf, mark = wire.StartMessage(s.conn.Buffer(), 'd')
-	}
-	if err := rows.Err(); err != nil {
+// settle sends the Sync a failed exchange still owes, reads through to
+// ReadyForQuery, and returns the failure.
+func (s *Conn) settle(failure error) error {
+	if err := s.conn.Send(wire.AppendSync(s.conn.Buffer())); err != nil {
 		return err
 	}
-	if len(buf)-mark == 4 {
-		return nil
+	if _, err := s.drain(nil); err != nil && !isServerError(err) {
+		return err
 	}
-	return s.conn.Send(wire.FinishMessage(buf, mark))
-}
-
-// appendCopyLine appends one row of COPY text format: tab-separated values,
-// \N for NULL, with backslash, tab, newline and carriage return escaped.
-func appendCopyLine(buf, scratch []byte, oids []uint32, values []any) ([]byte, []byte, error) {
-	for i, value := range values {
-		if i > 0 {
-			buf = append(buf, '\t')
-		}
-		text, null, err := codec.EncodeText(scratch[:0], oids[i], value)
-		if err != nil {
-			return buf, scratch, &ArgumentError{Index: i, Err: err}
-		}
-		scratch = text
-		if null {
-			buf = append(buf, `\N`...)
-			continue
-		}
-		buf = appendCopyEscaped(buf, text)
-	}
-	return append(buf, '\n'), scratch, nil
-}
-
-func appendCopyEscaped(buf, text []byte) []byte {
-	for _, b := range text {
-		switch b {
-		case '\\':
-			buf = append(buf, '\\', '\\')
-		case '\t':
-			buf = append(buf, '\\', 't')
-		case '\n':
-			buf = append(buf, '\\', 'n')
-		case '\r':
-			buf = append(buf, '\\', 'r')
-		default:
-			buf = append(buf, b)
-		}
-	}
-	return buf
+	return failure
 }
 
 // copyCount reads the row count from a "COPY n" tag.

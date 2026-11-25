@@ -28,6 +28,9 @@ var (
 	// ErrIsoLevel is a TxOptions.IsoLevel that is not one of the declared levels.
 	ErrIsoLevel = errors.New("caduceus: unknown isolation level")
 
-	// ErrEmptyBatch is SendBatch with no queries.
+	// ErrEmptyBatch is SendBatch or SendPipeline with no queries.
 	ErrEmptyBatch = errors.New("caduceus: batch is empty")
+
+	// ErrNoCopySource is CopyFrom with a nil source of rows.
+	ErrNoCopySource = errors.New("caduceus: CopyFrom needs a source of rows")
 )

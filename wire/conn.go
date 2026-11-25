@@ -19,6 +19,13 @@ const initialReadBuffer = 8 << 10
 // its size for the connection's lifetime.
 const shrinkAbove = 256 << 10
 
+// streamReadBuffer is what the buffer grows to while a result streams in
+// faster than it is read: a read that fills every free byte means more was
+// waiting. Eight times fewer reads for a large result, and given back once an
+// exchange no longer fills it, so a connection holds it only while it is
+// reading large results.
+const streamReadBuffer = 64 << 10
+
 // Conn is one connection to PostgreSQL after login.
 //
 // It is owned by one goroutine at a time; only IsClosed and CancelRequest may be
@@ -32,6 +39,12 @@ type Conn struct {
 	// exactly where it was and the connection usable.
 	rbuf       []byte
 	rpos, rend int
+	// streaming is a last read that filled the buffer, which means more was
+	// waiting; filled is any read that did so since the last ReadyForQuery.
+	// idle is an exchange that ended without one: the buffer is larger than
+	// what the connection is being used for, and is given back. A connection
+	// that reads large results back to back keeps its buffer between them.
+	streaming, filled, idle bool
 	// wbuf is lent to the caller by Buffer and returned by Send, so encoding a
 	// query allocates nothing once the connection has warmed up.
 	wbuf []byte
@@ -89,6 +102,22 @@ func (c *Conn) Send(messages []byte) error {
 	}
 	return nil
 }
+
+// Write writes encoded messages from a buffer the caller keeps, for one sent a
+// part at a time. Send, by contrast, takes its slice back as the write buffer.
+func (c *Conn) Write(messages []byte) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	if _, err := c.netConn.Write(messages); err != nil {
+		return c.fail(err)
+	}
+	return nil
+}
+
+// Keep leaves the buffer last lent by Buffer with the caller, who will send it
+// with Write. The next Buffer starts another.
+func (c *Conn) Keep() { c.wbuf = nil }
 
 // Notifications removes and returns the notifications received so far.
 func (c *Conn) Notifications() []Notification {

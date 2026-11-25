@@ -144,7 +144,12 @@ func encodeFloat(dst []byte, oid uint32, f float64) ([]byte, int16, bool, error)
 	case Float8:
 		return binary.BigEndian.AppendUint64(dst, math.Float64bits(f)), 1, false, nil
 	case Float4:
-		return binary.BigEndian.AppendUint32(dst, math.Float32bits(float32(f))), 1, false, nil
+		// A finite value too large for a real would arrive as infinity.
+		narrow := float32(f)
+		if math.IsInf(float64(narrow), 0) && !math.IsInf(f, 0) {
+			return dst, 0, false, fmt.Errorf("%w: %v as type %d", ErrOverflow, f, oid)
+		}
+		return binary.BigEndian.AppendUint32(dst, math.Float32bits(narrow)), 1, false, nil
 	case Int2, Int4, Int8:
 		if f == math.Trunc(f) && f >= math.MinInt64 && f < math.MaxInt64 {
 			return encodeInt(dst, oid, int64(f), f)

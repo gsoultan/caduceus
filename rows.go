@@ -18,6 +18,10 @@ type Rows struct {
 	session *Conn
 	stmt    *statement
 	inBatch bool
+	// ownSync is a statement of a pipeline, which has a Sync of its own: its
+	// result runs to a ReadyForQuery, which ends it without ending the
+	// exchange, and an error in it leaves the statements after it unaffected.
+	ownSync bool
 
 	values [][]byte
 	tag    string
@@ -63,12 +67,12 @@ func (c *Rows) Next() bool {
 			return true
 		case wire.MsgCommandComplete:
 			c.tag = c.session.tag(body)
-			if c.inBatch {
+			if c.inBatch && !c.ownSync {
 				c.ended = true
 				return false
 			}
 		case wire.MsgEmptyQueryResponse:
-			if c.inBatch {
+			if c.inBatch && !c.ownSync {
 				c.ended = true
 				return false
 			}
@@ -76,13 +80,17 @@ func (c *Rows) Next() bool {
 			if c.err == nil {
 				c.err = c.session.serverError(c.stmt, body)
 			}
-			if c.inBatch {
+			if c.inBatch && !c.ownSync {
 				// The server skips everything up to the batch's Sync, so the
 				// statements after this one have no replies of their own.
 				c.ended = true
 				return false
 			}
 		case wire.MsgReadyForQuery:
+			if c.ownSync {
+				c.ended = true
+				return false
+			}
 			c.settle(nil)
 			return false
 		}

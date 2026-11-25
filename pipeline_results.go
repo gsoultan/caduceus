@@ -1,0 +1,265 @@
+// Copyright (c) 2026 Gembit Soultan Shirazi <gembit.soultan@gmail.com>. All rights reserved.
+
+package caduceus
+
+import (
+	"context"
+
+	"github.com/gsoultan/caduceus/wire"
+)
+
+// pipelineWindow is how much a pipeline or a batch sends before it waits for
+// the reader to catch up. At most two windows are unread by the server at
+// once, 64 KiB, which is the receive window a server offers before it has read
+// anything, so they are taken off the client's hands even by a server that has
+// stopped reading because the client has not read its replies. Anything
+// larger and the two could each be waiting for the other to read.
+const pipelineWindow = 32 << 10
+
+// PipelineResults reads a pipeline's results, one statement at a time, in
+// the order they were queued.
+//
+// Unlike a batch, every statement of a pipeline is its own implicit
+// transaction: one that fails reports its error and the rest still run.
+// Statements are sent a window at a time as their results are read, so a
+// pipeline of a million statements never holds more than two windows of
+// encoded messages.
+//
+// Inside a transaction there is nothing to isolate, since the first failure
+// aborts the transaction whatever follows it. There a window shares one Sync,
+// which lets the server answer a whole window in a few packets rather than
+// one per statement: after a failure the rest of its window is skipped by the
+// server and reports the same error, and later windows fail with 25P02.
+type PipelineResults struct {
+	session   *Conn
+	queries   []Query
+	stmts     []*statement
+	temporary []string
+
+	// grouped is a pipeline inside a transaction block, where a window of
+	// statements shares one Sync. ends holds, for each window sent and not
+	// yet read to its end, the index just past its last statement, which is
+	// where its ReadyForQuery comes.
+	grouped bool
+	ends    []int
+	// skipUntil is the end of a window the server stopped running after
+	// skipErr: the statements before it have no replies.
+	skipUntil int
+	skipErr   error
+	// live is whether the current statement has replies on the connection.
+	live bool
+
+	// sent is how many statements have been sent. failed holds, for a
+	// statement that could not be encoded, why. Outside a transaction it is
+	// sent as a bare Sync, so that every statement still has exactly one
+	// ReadyForQuery; inside one it is not sent at all.
+	sent   int
+	failed map[int]error
+	// windowStart is the first statement of the last window sent; reading it
+	// is the signal to send the next.
+	windowStart int
+
+	next    int
+	current *Rows
+	failure error
+	settled bool
+	closed  bool
+}
+
+// SendPipeline sends queries without waiting for each reply and returns their
+// results in order. Every query is its own implicit transaction, so a failure
+// affects only that query; wrap the pipeline in Begin and Commit for one
+// transaction around all of them. Close the results before the next call on
+// the connection; Close also runs every query not yet read.
+func (s *Conn) SendPipeline(ctx context.Context, queries []Query) (*PipelineResults, error) {
+	if len(queries) == 0 {
+		return nil, ErrEmptyBatch
+	}
+	if err := s.begin(ctx); err != nil {
+		return nil, err
+	}
+	stmts, temporary, err := s.prepareBatch(queries)
+	if err != nil {
+		return nil, s.finish(err)
+	}
+	p := &PipelineResults{session: s, queries: queries, stmts: stmts, temporary: temporary}
+	p.grouped = s.conn.TxStatus() != wire.TxIdle
+	if err := p.sendWindow(); err != nil {
+		return nil, s.finish(err)
+	}
+	return p, nil
+}
+
+// sendWindow encodes and sends the next window of statements, and after the
+// last of them closes any statements prepared only for this pipeline.
+func (p *PipelineResults) sendWindow() error {
+	p.windowStart = p.sent
+	buf := p.session.conn.Buffer()
+	for p.sent < len(p.queries) && len(buf) < pipelineWindow {
+		encoded, err := appendBind(buf, p.stmts[p.sent], p.queries[p.sent].Arguments)
+		if err != nil {
+			p.recordFailure(p.sent, err)
+		} else {
+			buf = wire.AppendExecute(encoded, "", 0)
+		}
+		if !p.grouped {
+			buf = wire.AppendSync(buf)
+		}
+		p.sent++
+	}
+	if p.grouped {
+		buf = wire.AppendSync(buf)
+		p.ends = append(p.ends, p.sent)
+	}
+	if p.sent == len(p.queries) && len(p.temporary) > 0 {
+		for _, name := range p.temporary {
+			buf = wire.AppendClose(buf, 'S', name)
+		}
+		buf = wire.AppendSync(buf)
+	}
+	return p.session.conn.Send(buf)
+}
+
+func (p *PipelineResults) recordFailure(i int, err error) {
+	if p.failed == nil {
+		p.failed = make(map[int]error)
+	}
+	p.failed[i] = err
+}
+
+// statementInto positions rows at the next statement's result.
+func (p *PipelineResults) statementInto(rows *Rows) error {
+	p.finishCurrent()
+	if p.settled {
+		if p.failure != nil {
+			return p.failure
+		}
+		return errBatchExhausted
+	}
+	if p.next >= len(p.queries) {
+		return errBatchExhausted
+	}
+	if p.next >= p.windowStart && p.sent < len(p.queries) {
+		if err := p.sendWindow(); err != nil {
+			p.settled = true
+			return p.remember(p.session.finish(err))
+		}
+	}
+	*rows = Rows{}
+	rows.init(p.session, p.stmts[p.next], true)
+	rows.ownSync = !p.grouped
+	p.live = true
+	if err, ok := p.failed[p.next]; ok {
+		rows.err = err
+		// Inside a transaction a statement that could not be encoded was
+		// never sent, so it has nothing to read.
+		p.live = !p.grouped
+	} else if p.next < p.skipUntil {
+		rows.err, p.live = p.skipErr, false
+	}
+	rows.ended = !p.live
+	p.current = rows
+	p.next++
+	return nil
+}
+
+func (p *PipelineResults) finishCurrent() {
+	if p.current == nil {
+		return
+	}
+	current := p.current
+	p.current = nil
+	current.Close()
+	if current.err != nil && p.failure == nil {
+		p.failure = current.err
+	}
+	if current.settled {
+		p.settled = true
+	}
+	if !p.grouped || p.settled || len(p.ends) == 0 {
+		return
+	}
+	if p.live && current.err != nil {
+		// The server skips the rest of the window, up to its Sync.
+		p.skipUntil, p.skipErr = p.ends[0], current.err
+		p.endWindow()
+		return
+	}
+	if p.next == p.ends[0] {
+		p.endWindow()
+	}
+}
+
+// endWindow reads up to the ReadyForQuery that ends the oldest window.
+func (p *PipelineResults) endWindow() {
+	p.ends = p.ends[1:]
+	if _, err := p.session.drain(nil); err != nil && !isServerError(err) {
+		p.settled = true
+		p.remember(p.session.finish(err))
+	}
+}
+
+func (p *PipelineResults) remember(err error) error {
+	if err != nil && p.failure == nil {
+		p.failure = err
+	}
+	return p.failure
+}
+
+// Exec reads the next statement's result, discarding any rows, and returns
+// its command tag.
+func (p *PipelineResults) Exec() (string, error) {
+	rows := new(Rows)
+	if err := p.statementInto(rows); err != nil {
+		return "", err
+	}
+	rows.Close()
+	return rows.tag, rows.err
+}
+
+// Query returns the next statement's rows. Reading the next result, or
+// closing the pipeline, closes them.
+func (p *PipelineResults) Query() (*Rows, error) {
+	rows := new(Rows)
+	if err := p.statementInto(rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// QueryRow returns the next statement's result as a single row.
+func (p *PipelineResults) QueryRow() *Row {
+	row := new(Row)
+	row.err = p.statementInto(&row.rows)
+	return row
+}
+
+// Close runs and reads every statement not yet read, and returns the first
+// error of the whole pipeline. It is idempotent, and the connection is free
+// once it returns.
+func (p *PipelineResults) Close() error {
+	if p.closed {
+		return p.failure
+	}
+	p.closed = true
+	var rows Rows
+	for !p.settled && p.next < len(p.queries) {
+		if p.statementInto(&rows) != nil {
+			break
+		}
+	}
+	p.finishCurrent()
+	if p.settled {
+		return p.failure
+	}
+	if len(p.temporary) > 0 {
+		// The trailing Close of the pipeline's own statements has one more
+		// ReadyForQuery.
+		if _, err := p.session.drain(nil); err != nil {
+			p.settled = true
+			return p.remember(p.session.finish(err))
+		}
+	}
+	p.settled = true
+	return p.remember(p.session.finish(nil))
+}

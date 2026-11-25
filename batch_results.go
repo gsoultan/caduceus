@@ -14,13 +14,37 @@ var errBatchExhausted = errors.New("caduceus: no more results in the batch")
 // BatchResults reads a pipelined batch's replies off the connection, one
 // statement at a time, in the order they were queued.
 type BatchResults struct {
-	session *Conn
-	stmts   []*statement
+	session   *Conn
+	stmts     []*statement
+	temporary []string
+
+	// pending is a batch too large to send at once, and windows the parts it
+	// goes in, of which sent have gone and written bytes with them. A batch
+	// that went in one write has none of these.
+	pending []byte
+	windows []batchWindow
+	sent    int
+	written int
+
 	next    int
 	current *Rows
 	failure error
 	settled bool
 }
+
+// sendWindow writes the next window of a batch sent in parts.
+func (b *BatchResults) sendWindow() error {
+	window := b.windows[b.sent]
+	err := b.session.conn.Write(b.pending[b.written:window.end])
+	b.sent, b.written = b.sent+1, window.end
+	if b.sent == len(b.windows) {
+		b.pending = nil
+	}
+	return err
+}
+
+// unsent reports whether part of the batch has yet to be sent.
+func (b *BatchResults) unsent() bool { return b.sent < len(b.windows) }
 
 // statement returns a cursor over the next statement's result, closing the
 // previous one first so the connection is positioned at its start.
@@ -35,6 +59,11 @@ func (b *BatchResults) statement() (*Rows, error) {
 // statementInto is statement into rows the caller supplies.
 func (b *BatchResults) statementInto(rows *Rows) error {
 	b.finishCurrent()
+	if b.failure != nil && !b.settled {
+		// The server ran nothing after the statement that failed, so the rest
+		// have no result to read: they report the failure too.
+		b.close()
+	}
 	if b.settled {
 		if b.failure != nil {
 			return b.failure
@@ -44,6 +73,16 @@ func (b *BatchResults) statementInto(rows *Rows) error {
 	if b.next >= len(b.stmts) {
 		return errBatchExhausted
 	}
+	// Reading the first statement of the last window sent is the moment to
+	// send the next, which keeps the server supplied and never has more than
+	// two windows unread by it.
+	if b.unsent() && b.next >= b.windows[b.sent-1].first {
+		if err := b.sendWindow(); err != nil {
+			b.settled = true
+			return b.remember(b.session.finish(err))
+		}
+	}
+	*rows = Rows{}
 	rows.init(b.session, b.stmts[b.next], true)
 	b.current = rows
 	b.next++
@@ -73,8 +112,12 @@ func (b *BatchResults) note(c *Rows) {
 // returns the batch's first error.
 func (b *BatchResults) close() error {
 	b.finishCurrent()
+	b.readUnsent()
 	if b.settled {
 		return b.failure
+	}
+	if b.failure != nil {
+		b.abandon()
 	}
 	for {
 		kind, body, err := b.session.conn.Receive()
@@ -89,6 +132,41 @@ func (b *BatchResults) close() error {
 			b.settled = true
 			return b.remember(b.session.finish(nil))
 		}
+	}
+}
+
+// readUnsent reads results, which sends the windows behind them, until the
+// whole batch has been sent or a statement has failed. What is left then is
+// replies alone, which close reads without telling them apart.
+func (b *BatchResults) readUnsent() {
+	if !b.unsent() {
+		return
+	}
+	rows := new(Rows)
+	for b.unsent() && b.failure == nil && !b.settled {
+		if b.statementInto(rows) != nil {
+			return
+		}
+		b.finishCurrent()
+	}
+}
+
+// abandon ends a batch a statement of which failed. The server is skipping
+// everything up to a Sync, so if the batch's own has not been sent, in its
+// last window, one is sent in its place and the rest never goes. The batch's
+// own statements were to be closed ahead of that Sync, and were skipped with
+// the rest, so they are queued to be closed with the next exchange.
+func (b *BatchResults) abandon() {
+	b.session.closing = append(b.session.closing, b.temporary...)
+	b.temporary = nil
+	if !b.unsent() {
+		return
+	}
+	b.sent, b.pending = len(b.windows), nil
+	var sync [5]byte
+	if err := b.session.conn.Write(wire.AppendSync(sync[:0])); err != nil {
+		b.settled = true
+		b.remember(b.session.finish(err))
 	}
 }
 

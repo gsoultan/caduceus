@@ -61,5 +61,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - run: go test -race -count=1 ./...
-      - name: Benchmarks against pgx and database/sql
-        run: cd benchmarks && go test -run='^$' -bench=. -benchtime=2000x ./...
+      # A smoke run: that every contender still runs each workload. A hundred
+      # iterations keep the slow ones, a thousand inserts through database/sql,
+      # to seconds; the numbers in the README come from 3-second runs.
+      - name: Benchmarks against pgx, database/sql and lib/pq
+        run: cd benchmarks && go test -run='^$' -bench=. -benchtime=100x ./...

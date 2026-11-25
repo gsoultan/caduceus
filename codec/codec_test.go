@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -152,5 +153,109 @@ func TestEncodeTextFastPathMatchesTheGeneralPath(t *testing.T) {
 	}
 	if _, _, err := EncodeText(nil, Int2, 1<<20); !errors.Is(err, ErrOverflow) {
 		t.Errorf("EncodeText(int2, 1<<20) = %v, want ErrOverflow", err)
+	}
+}
+
+// The decimal fast path that numeric columns take must give exactly what
+// strconv gives, and leave to it whatever it cannot do exactly.
+func TestParseDecimalFastMatchesStrconv(t *testing.T) {
+	t.Parallel()
+	for _, text := range []string{"0", "-0", "1.5", "-123.45", "0.1", "0.3", "123456789012345",
+		"0.000000000000000000001", "99999.99999", "+7", "1e5", "1234567890123456", ".5", "5.", "-", ".", "", "1.2.3", "0.0000000000000000000000001"} {
+		want, wantErr := strconv.ParseFloat(text, 64)
+		got, ok := parseDecimalFast([]byte(text))
+		if !ok {
+			continue
+		}
+		if wantErr != nil || got != want || math.Signbit(got) != math.Signbit(want) {
+			t.Errorf("parseDecimalFast(%q) = %v, strconv = %v, %v", text, got, want, wantErr)
+		}
+	}
+}
+
+func FuzzParseDecimalFast(f *testing.F) {
+	for _, seed := range []string{"1.5", "-0.25", "123456789.123456"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, text string) {
+		got, ok := parseDecimalFast([]byte(text))
+		if !ok {
+			return
+		}
+		want, err := strconv.ParseFloat(text, 64)
+		if err != nil || got != want {
+			t.Fatalf("parseDecimalFast(%q) = %v, strconv = %v, %v", text, got, want, err)
+		}
+	})
+}
+
+// EncodeBinary writes what the type's receive function reads, and refuses what
+// only its input function could: writing the text of "42" where an int4's four
+// bytes belong would be accepted by the server as a different number.
+func TestEncodeBinary(t *testing.T) {
+	cases := []struct {
+		name string
+		oid  uint32
+		arg  any
+		want []byte
+		null bool
+		err  error
+	}{
+		{"int8", Int8, int64(1), []byte{0, 0, 0, 0, 0, 0, 0, 1}, false, nil},
+		{"int for int2", Int2, 7, []byte{0, 7}, false, nil},
+		{"bool", Bool, true, []byte{1}, false, nil},
+		{"text", Text, "tab\there", []byte("tab\there"), false, nil},
+		{"int for text", Text, 42, []byte("42"), false, nil},
+		{"bytea", Bytea, []byte{0, 0xff}, []byte{0, 0xff}, false, nil},
+		{"json", JSON, `{"a":1}`, []byte(`{"a":1}`), false, nil},
+		{"jsonb", JSONB, `{"a":1}`, append([]byte{1}, `{"a":1}`...), false, nil},
+		{"jsonb value", JSONB, map[string]int{"a": 1}, append([]byte{1}, `{"a":1}`...), false, nil},
+		{"null", Int4, nil, nil, true, nil},
+		{"null jsonb", JSONB, nil, nil, true, nil},
+		{"nil pointer", Text, (*string)(nil), nil, true, nil},
+		{"string for int4", Int4, "42", nil, false, ErrNoBinary},
+		{"string for timestamptz", Timestamptz, "tomorrow", nil, false, ErrNoBinary},
+		{"hex for bytea", Bytea, `\x00ff`, nil, false, ErrNoBinary},
+		{"time for time of day", Time, time.Unix(0, 0), nil, false, ErrNoBinary},
+		{"overflow", Int2, 70000, nil, false, ErrOverflow},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, null, err := EncodeBinary([]byte("kept"), c.oid, c.arg)
+			if !errors.Is(err, c.err) || null != c.null {
+				t.Fatalf("EncodeBinary = null %v, %v; want null %v, %v", null, err, c.null, c.err)
+			}
+			if string(got) != "kept"+string(c.want) {
+				t.Fatalf("EncodeBinary appended %q, want %q", got[4:], c.want)
+			}
+		})
+	}
+}
+
+func TestBinaryInput(t *testing.T) {
+	for _, oid := range []uint32{Bool, Bytea, Int2, Int4, Int8, Float4, Float8, Text, Varchar, Bpchar, Date, Timestamp, Timestamptz, UUID, JSON, JSONB} {
+		if !BinaryInput(oid) {
+			t.Errorf("BinaryInput(%d) = false", oid)
+		}
+	}
+	// numeric has a binary form the codec does not write; name and "char"
+	// receive more strictly than they parse.
+	for _, oid := range []uint32{Numeric, Name, Char, 1007, 600} {
+		if BinaryInput(oid) {
+			t.Errorf("BinaryInput(%d) = true", oid)
+		}
+	}
+}
+
+// A float64 too large for a real used to be narrowed to infinity and sent, so
+// the server stored Infinity where its own parser would have refused the value.
+func TestEncodeRefusesFloatOverflowingReal(t *testing.T) {
+	if _, _, _, err := Encode(nil, Float4, 1e300); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("Encode(1e300 as real) = %v, want ErrOverflow", err)
+	}
+	for _, f := range []float64{math.MaxFloat32, math.Inf(1), math.Inf(-1), math.NaN(), 1.5} {
+		if _, format, _, err := Encode(nil, Float4, f); err != nil || format != 1 {
+			t.Errorf("Encode(%v as real) = format %d, %v", f, format, err)
+		}
 	}
 }

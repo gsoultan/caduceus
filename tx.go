@@ -152,3 +152,15 @@ func (t *Tx) CopyFrom(ctx context.Context, table, columns []string, rows CopySou
 
 // Conn returns the connection the transaction runs on.
 func (t *Tx) Conn() *Conn { return t.conn }
+
+// SendPipeline sends a pipeline inside the transaction. Every statement of it
+// is then part of the transaction, and the first the server refuses aborts
+// it, as any failed statement in a transaction does: the statements after it
+// do not run and report an error too. This is the fastest way to run many
+// statements, since the server answers them a window at a time.
+func (t *Tx) SendPipeline(ctx context.Context, queries []Query) (*PipelineResults, error) {
+	if t.done {
+		return nil, ErrTxClosed
+	}
+	return t.conn.SendPipeline(ctx, queries)
+}

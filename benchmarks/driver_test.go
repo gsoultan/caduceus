@@ -14,12 +14,13 @@ import (
 	"github.com/gsoultan/caduceus"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/lib/pq"
 )
 
 // caduceus against its competitors, each on one connection with one caller,
 // so a number is the driver's cost per operation with no pool or queueing in
-// it. database/sql runs over pgx's stdlib driver, the usual way to reach
-// PostgreSQL through database/sql, with its pool held to one connection.
+// it. database/sql runs twice, over pgx's stdlib driver and over lib/pq, with
+// its pool held to one connection.
 //
 // "SELECT 1" barely touches a driver, so these workloads bind parameters,
 // decode typed rows, run transactions, pipeline batches and copy rows, which
@@ -61,7 +62,21 @@ func scanRows(b *testing.B, next func() bool, scan func(...any) error) int {
 	return n
 }
 
-func connections(b *testing.B) (*caduceus.Conn, *pgx.Conn, *sql.DB) {
+// sqlPool is the database/sql side of a benchmark: the same closures run
+// once over pgx's stdlib driver and once over lib/pq, with DB switched between
+// them by runAll.
+type sqlPool struct {
+	*sql.DB
+	drivers map[string]*sql.DB
+}
+
+// sqlDrivers are the database/sql drivers measured, by the name each result
+// is reported under.
+var sqlDrivers = map[string]string{"database-sql-pgx": "pgx", "lib-pq": "postgres"}
+
+var currentSQL *sqlPool
+
+func connections(b *testing.B) (*caduceus.Conn, *pgx.Conn, *sqlPool) {
 	b.Helper()
 	ctx := b.Context()
 	url := dsn(b)
@@ -73,21 +88,53 @@ func connections(b *testing.B) (*caduceus.Conn, *pgx.Conn, *sql.DB) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	db, err := sql.Open("pgx", url)
-	if err != nil {
-		b.Fatal(err)
+	pool := &sqlPool{drivers: map[string]*sql.DB{}}
+	for name, driver := range sqlDrivers {
+		db, err := sql.Open(driver, url)
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		if err := db.PingContext(ctx); err != nil {
+			b.Fatal(err)
+		}
+		pool.drivers[name] = db
+		b.Cleanup(func() { _ = db.Close() })
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	if err := db.PingContext(ctx); err != nil {
-		b.Fatal(err)
-	}
+	currentSQL = pool
 	b.Cleanup(func() {
 		_ = cad.Close(context.Background())
 		_ = px.Close(context.Background())
-		_ = db.Close()
 	})
-	return cad, px, db
+	return cad, px, pool
+}
+
+// pqCopy copies rows the way lib/pq does a COPY: a statement prepared from
+// CopyIn inside a transaction, one Exec per row, and an Exec with no arguments
+// to send what is buffered.
+func pqCopy(ctx context.Context, db *sql.DB, table string, columns []string, rows [][]any) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn(table, columns...))
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if _, err := stmt.ExecContext(ctx, row...); err != nil {
+			return err
+		}
+	}
+	if _, err := stmt.ExecContext(ctx); err != nil {
+		return err
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // processCPU is the CPU time this process has used, user and system, in
@@ -99,7 +146,21 @@ func processCPU() int64 {
 }
 
 func runAll(b *testing.B, contenders []contender) {
+	var expanded []contender
 	for _, c := range contenders {
+		if c.name != "database-sql" {
+			expanded = append(expanded, c)
+			continue
+		}
+		for _, name := range []string{"database-sql-pgx", "lib-pq"} {
+			run := c.run
+			expanded = append(expanded, contender{name, func(b *testing.B, ctx context.Context) {
+				currentSQL.DB = currentSQL.drivers[name]
+				run(b, ctx)
+			}})
+		}
+	}
+	for _, c := range expanded {
 		b.Run(c.name, func(b *testing.B) {
 			ctx := context.Background()
 			b.ReportAllocs()
@@ -298,8 +359,9 @@ func BenchmarkBatch10(b *testing.B) {
 	})
 }
 
-// A thousand rows into a table with COPY. database/sql has no COPY, so it
-// inserts them in one transaction with a prepared statement.
+// A thousand rows into a table with each driver's COPY. lib/pq's is CopyIn,
+// reached through database/sql; pgx's database/sql driver has none, and the
+// same rows as INSERT statements are BenchmarkInsert1000InTransaction.
 func BenchmarkCopy1000(b *testing.B) {
 	cad, px, db := connections(b)
 	table := benchTable(b, cad)
@@ -323,13 +385,73 @@ func BenchmarkCopy1000(b *testing.B) {
 				}
 			}
 		}},
+		{"lib-pq-copyin", func(b *testing.B, ctx context.Context) {
+			for b.Loop() {
+				if err := pqCopy(ctx, db.drivers["lib-pq"], table, columns, rows); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
+	})
+}
+
+// A thousand INSERT statements, each with its own parameters, in one
+// transaction. caduceus pipelines them and pgx batches them, both without
+// waiting for each reply; database/sql can only run them one after another.
+func BenchmarkInsert1000InTransaction(b *testing.B) {
+	cad, px, db := connections(b)
+	table := benchTable(b, cad)
+	insert := "INSERT INTO " + table + " VALUES ($1, $2)"
+	rows := make([][]any, 1000)
+	queries := make([]caduceus.Query, len(rows))
+	for i := range rows {
+		rows[i] = []any{int64(i), "row " + strconv.Itoa(i)}
+		queries[i] = caduceus.Query{SQL: insert, Arguments: rows[i]}
+	}
+	runAll(b, []contender{
+		{"caduceus", func(b *testing.B, ctx context.Context) {
+			for b.Loop() {
+				tx, err := cad.Begin(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				results, err := tx.SendPipeline(ctx, queries)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := results.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
+		{"pgx", func(b *testing.B, ctx context.Context) {
+			for b.Loop() {
+				tx, err := px.Begin(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				batch := &pgx.Batch{}
+				for _, row := range rows {
+					batch.Queue(insert, row...)
+				}
+				if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
 		{"database-sql", func(b *testing.B, ctx context.Context) {
 			for b.Loop() {
 				tx, err := db.BeginTx(ctx, nil)
 				if err != nil {
 					b.Fatal(err)
 				}
-				stmt, err := tx.PrepareContext(ctx, "INSERT INTO "+table+" VALUES ($1, $2)")
+				stmt, err := tx.PrepareContext(ctx, insert)
 				if err != nil {
 					b.Fatal(err)
 				}

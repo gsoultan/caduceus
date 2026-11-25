@@ -117,3 +117,26 @@ func TestLiveWrongPassword(t *testing.T) {
 	_ = config
 	_ = url.QueryEscape
 }
+
+// The read buffer grows while a large result streams in and is given back
+// afterwards. Everything per connection is multiplied by a pool's size, so a
+// connection that once read a large result must not hold the larger buffer
+// while it sits idle.
+func TestLiveReadBufferGrowsForAStreamAndShrinksBack(t *testing.T) {
+	conn := liveConn(t)
+	result, err := conn.QueryText(t.Context(), "SELECT g, repeat('x', 40) FROM generate_series(1, 20000) AS g")
+	if err != nil || len(result.Rows) != 20000 {
+		t.Fatalf("QueryText() = %d rows, %v", len(result.Rows), err)
+	}
+	if len(conn.rbuf) <= initialReadBuffer || len(conn.rbuf) > streamReadBuffer {
+		t.Fatalf("buffer after a megabyte of rows = %d, want it grown, and to at most %d", len(conn.rbuf), streamReadBuffer)
+	}
+	for range 2 {
+		if _, err := conn.QueryText(t.Context(), "SELECT 1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(conn.rbuf) != initialReadBuffer {
+		t.Fatalf("buffer on an idle connection = %d, want %d", len(conn.rbuf), initialReadBuffer)
+	}
+}

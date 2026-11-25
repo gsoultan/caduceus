@@ -72,7 +72,57 @@ func parseFloat(src []byte) (float64, error) {
 	case "NaN":
 		return math.NaN(), nil
 	}
+	if f, ok := parseDecimalFast(src); ok {
+		return f, nil
+	}
 	return strconv.ParseFloat(string(src), 64)
+}
+
+// exactPow10 holds the powers of ten a float64 represents exactly.
+var exactPow10 = [...]float64{1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22}
+
+// parseDecimalFast parses plain decimal text, such as a numeric's "-123.45",
+// when the result is exact: at most 15 significant digits and 22 fraction
+// digits, so the digits fit a float64 exactly and one correctly rounded
+// division by an exact power of ten gives the same float strconv would. It
+// reports false for anything else, which strconv then parses.
+func parseDecimalFast(src []byte) (float64, bool) {
+	i, negative := 0, false
+	if len(src) > 0 && (src[0] == '-' || src[0] == '+') {
+		negative, i = src[0] == '-', 1
+	}
+	var mantissa uint64
+	digits, fraction, dot, any := 0, 0, false, false
+	for ; i < len(src); i++ {
+		b := src[i]
+		switch {
+		case b >= '0' && b <= '9':
+			any = true
+			if mantissa != 0 || b != '0' {
+				digits++
+			}
+			mantissa = mantissa*10 + uint64(b-'0')
+			if dot {
+				fraction++
+			}
+		case b == '.' && !dot:
+			dot = true
+		default:
+			return 0, false
+		}
+		if digits > 15 || fraction >= len(exactPow10) {
+			return 0, false
+		}
+	}
+	if !any {
+		return 0, false
+	}
+	f := float64(mantissa) / exactPow10[fraction]
+	if negative {
+		f = -f
+	}
+	return f, true
 }
 
 func parseBool(src []byte) (bool, error) {

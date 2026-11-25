@@ -10,6 +10,7 @@ require github.com/gsoultan/caduceus v0.0.0
 require (
 	github.com/jackc/pglogrepl v0.0.0-20260401131349-e37c41485510
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/lib/pq v1.10.9
 )
 
 require (

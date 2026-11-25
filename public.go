@@ -75,10 +75,13 @@ func (s *Conn) QueryRow(ctx context.Context, sql string, args ...any) *Row {
 	return row
 }
 
-// SendBatch sends every query in at most two round trips and returns their
-// results in order. The batch runs as one implicit transaction: a statement
-// that fails makes the server skip the rest. Close the results before the next
-// call on the connection.
+// SendBatch sends every query without waiting for each reply and returns their
+// results in order: in at most two round trips for a batch that fits one
+// window of 32 KiB, and a window at a time, as the results are read, for a
+// larger one. The batch runs as one implicit transaction: a statement that
+// fails undoes those before it, and it and every statement after it report the
+// failure. Close the results before the next call on the connection; Close
+// also runs whatever of the batch has not been read.
 func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, error) {
 	if len(queries) == 0 {
 		return nil, ErrEmptyBatch
@@ -89,6 +92,16 @@ func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, e
 // CopyFrom streams rows into a table with COPY and returns how many it copied.
 // table is the name, schema-qualified as separate parts if need be, such as
 // []string{"public", "users"}. Every name is quoted.
+//
+// The rows go in COPY's binary format, which the server reads without
+// parsing, when every column has a type the driver writes in binary: the
+// integers, floats, bool, text, varchar, char, bytea, uuid, date, timestamp,
+// timestamptz, interval, json and jsonb. With any other column they go in text.
+//
+// A value only the server can read, such as a string for an integer column, is
+// not refused. From that row on the rows go in text, as a second COPY run
+// before the first is committed, so the rows are still copied all or none;
+// statement-level triggers and constraint checks run once for each of the two.
 func (s *Conn) CopyFrom(ctx context.Context, table, columns []string, rows CopySource) (int64, error) {
 	return s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
 }

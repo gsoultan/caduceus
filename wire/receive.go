@@ -36,6 +36,7 @@ func (c *Conn) Receive() (byte, []byte, error) {
 				return 0, nil, c.fail(ErrProtocol)
 			}
 			c.txStatus = body[0]
+			c.idle, c.filled = !c.filled, false
 			return kind, body, nil
 		default:
 			return kind, body, nil
@@ -93,6 +94,8 @@ func (c *Conn) fill(n int) error {
 	for c.rend-c.rpos < n {
 		read, err := c.netConn.Read(c.rbuf[c.rend:])
 		c.rend += read
+		c.streaming = c.rend == len(c.rbuf)
+		c.filled = c.filled || c.streaming
 		if err == nil {
 			continue
 		}
@@ -112,8 +115,13 @@ func (c *Conn) fill(n int) error {
 // message that is now gone is let go first.
 func (c *Conn) makeRoom(n int) {
 	pending := c.rend - c.rpos
-	if pending == 0 && len(c.rbuf) > shrinkAbove && n <= initialReadBuffer {
-		c.rbuf = make([]byte, initialReadBuffer)
+	if pending == 0 && n <= initialReadBuffer && c.shrinkable() {
+		c.rbuf, c.rpos, c.rend = make([]byte, initialReadBuffer), 0, 0
+		c.streaming = false
+	}
+	if c.streaming && len(c.rbuf) < streamReadBuffer && n <= streamReadBuffer {
+		n = max(n, 2*len(c.rbuf))
+		c.streaming = false
 	}
 	if len(c.rbuf) < n {
 		grown := make([]byte, max(n, 2*len(c.rbuf)))
@@ -125,6 +133,12 @@ func (c *Conn) makeRoom(n int) {
 		copy(c.rbuf, c.rbuf[c.rpos:c.rend])
 		c.rpos, c.rend = 0, pending
 	}
+}
+
+// shrinkable reports whether the buffer is larger than this connection needs
+// now: grown for one large message, or for a stream that has since ended.
+func (c *Conn) shrinkable() bool {
+	return len(c.rbuf) > shrinkAbove || (c.idle && len(c.rbuf) > initialReadBuffer)
 }
 
 // isTimeout reports whether err is a deadline expiring.
