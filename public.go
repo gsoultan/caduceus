@@ -1,0 +1,126 @@
+// Copyright (c) 2026 Gembit Soultan Shirazi <gembit.soultan@gmail.com>. All rights reserved.
+
+package caduceus
+
+import (
+	"context"
+
+	"github.com/gsoultan/caduceus/wire"
+)
+
+// Connect parses connString, connects, and returns a Conn on the connection.
+//
+// connString is a URL (postgres://user:pass@host:port/db?sslmode=require) or
+// key=value pairs, and the PG* environment variables and the password file fill
+// in what it leaves out, as they do for libpq.
+func Connect(ctx context.Context, connString string, options Options) (*Conn, error) {
+	config, err := wire.ParseConfig(connString)
+	if err != nil {
+		return nil, err
+	}
+	return ConnectConfig(ctx, config, options)
+}
+
+// ConnectConfig connects with a parsed configuration. A pool that opens many
+// connections parses once and passes a Copy of the config to each.
+func ConnectConfig(ctx context.Context, config *wire.Config, options Options) (*Conn, error) {
+	conn, err := wire.Connect(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return New(conn, options), nil
+}
+
+// New runs queries on a connection that is already open and idle.
+//
+// A Conn belongs to one goroutine at a time. It has no lock: a pool hands it to
+// one caller, and an application that shares one between goroutines must
+// serialise them itself.
+func New(conn *wire.Conn, options Options) *Conn {
+	c := &Conn{conn: conn}
+	if n := options.statements(); n > 0 {
+		c.cache = newStatementCache(n)
+	}
+	return c
+}
+
+// Exec runs a statement and returns its command tag, such as "UPDATE 3".
+//
+// Without arguments it goes over the simple protocol, one round trip that
+// allows several statements separated by semicolons. With arguments they are
+// bound as parameters, never interpolated.
+func (s *Conn) Exec(ctx context.Context, sql string, args ...any) (string, error) {
+	return s.exec(ctx, sql, args)
+}
+
+// Query runs a query and returns its rows, which are read off the connection
+// as they are iterated. The connection is busy until the rows are read to the
+// end or closed.
+func (s *Conn) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
+	return s.query(ctx, sql, args)
+}
+
+// QueryInto is Query into rows the caller supplies, so a type that embeds Rows
+// costs one allocation rather than two. rows must not be in use.
+func (s *Conn) QueryInto(ctx context.Context, rows *Rows, sql string, args ...any) error {
+	*rows = Rows{}
+	return s.queryInto(ctx, sql, args, rows)
+}
+
+// QueryRow runs a query expected to return at most one row. Its error, if any,
+// is reported by the row's Scan.
+func (s *Conn) QueryRow(ctx context.Context, sql string, args ...any) *Row {
+	row := new(Row)
+	row.err = s.queryInto(ctx, sql, args, &row.rows)
+	return row
+}
+
+// SendBatch sends every query in at most two round trips and returns their
+// results in order. The batch runs as one implicit transaction: a statement
+// that fails makes the server skip the rest. Close the results before the next
+// call on the connection.
+func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, error) {
+	if len(queries) == 0 {
+		return nil, ErrEmptyBatch
+	}
+	return s.batch(ctx, queries)
+}
+
+// CopyFrom streams rows into a table with COPY and returns how many it copied.
+// table is the name, schema-qualified as separate parts if need be, such as
+// []string{"public", "users"}. Every name is quoted.
+func (s *Conn) CopyFrom(ctx context.Context, table, columns []string, rows CopySource) (int64, error) {
+	return s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
+}
+
+// WaitForNotification blocks until a NOTIFY arrives on a channel the
+// connection LISTENs to, or ctx is done. A notification that arrived while
+// another query ran is returned first, without reading.
+func (s *Conn) WaitForNotification(ctx context.Context) (wire.Notification, error) {
+	if s.open {
+		return wire.Notification{}, ErrConnBusy
+	}
+	return s.conn.WaitForNotification(ctx)
+}
+
+// Busy reports whether a result is open: rows not read to the end, or a batch
+// not closed. A busy connection must not be handed to anyone else.
+func (s *Conn) Busy() bool { return s.open }
+
+// TxStatus is the server's transaction status as of the last ReadyForQuery:
+// 'I' idle, 'T' in a transaction, 'E' in a failed transaction.
+func (s *Conn) TxStatus() byte { return s.conn.TxStatus() }
+
+// IsClosed reports whether the connection is closed or broken.
+func (s *Conn) IsClosed() bool { return s.conn.IsClosed() }
+
+// ForgetStatements drops every cached statement without telling the server,
+// for when the server has already dropped them, as DISCARD ALL does.
+func (s *Conn) ForgetStatements() { s.forgetStatements() }
+
+// Wire returns the underlying protocol connection, for what Conn does not
+// wrap. Using it while a result is open corrupts the exchange.
+func (s *Conn) Wire() *wire.Conn { return s.conn }
+
+// Close terminates the connection. It is idempotent.
+func (s *Conn) Close(ctx context.Context) error { return s.conn.Close(ctx) }

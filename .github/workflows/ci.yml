@@ -1,0 +1,65 @@
+# Copyright (c) 2026 Gembit Soultan Shirazi <gembit.soultan@gmail.com>. All rights reserved.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26.5'
+
+jobs:
+  check:
+    name: Format, vet, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      # The benchmarks are a module of their own, so vet them separately.
+      - run: go vet ./... && (cd benchmarks && go vet ./...)
+      - name: The core module requires nothing
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "::error::caduceus must not depend on any module"; exit 1
+          fi
+      - run: go test -race -count=1 ./...
+
+  live:
+    name: Against PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        postgres: ['14', '17']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -race -count=1 ./...
+      - name: Benchmarks against pgx and database/sql
+        run: cd benchmarks && go test -run='^$' -bench=. -benchtime=2000x ./...

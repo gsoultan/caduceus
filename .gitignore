@@ -1,0 +1,5 @@
+# go.sum is committed: a module needs it to build from a fresh clone.
+*.test
+*.out
+*.prof
+testdata/fuzz/
