@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -77,10 +78,12 @@ func parseSettings(text string) (map[string]string, error) {
 }
 
 func parseURL(text string) (map[string]string, error) {
+	text, hostPart := cutHosts(text)
 	parsed, err := url.Parse(text)
 	if err != nil {
 		return nil, ErrInvalidConnString
 	}
+	parsed.Host = hostPart
 	settings := map[string]string{}
 	if parsed.User != nil {
 		settings["user"] = parsed.User.Username()
@@ -88,20 +91,17 @@ func parseURL(text string) (map[string]string, error) {
 			settings["password"] = password
 		}
 	}
-	if host := parsed.Hostname(); host != "" {
-		settings["host"] = host
-	}
-	if port := parsed.Port(); port != "" {
-		settings["port"] = port
+	if hosts, ports := splitHosts(parsed.Host); hosts != "" {
+		settings["host"] = hosts
+		if strings.Trim(ports, ",") != "" {
+			settings["port"] = ports
+		}
 	}
 	if database := strings.TrimPrefix(parsed.Path, "/"); database != "" {
 		settings["dbname"] = database
 	}
 	for key, values := range parsed.Query() {
 		settings[key] = values[len(values)-1]
-	}
-	if strings.Contains(parsed.Host, ",") {
-		return nil, fmt.Errorf("%w: more than one host is not supported", ErrInvalidConnString)
 	}
 	return settings, nil
 }
@@ -177,8 +177,8 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	if err := config.protocol(settings); err != nil {
 		return nil, err
 	}
-	if attrs := settings["target_session_attrs"]; attrs != "" && attrs != "any" {
-		return nil, fmt.Errorf("%w: target_session_attrs=%s is not supported", ErrInvalidConnString, attrs)
+	if err := config.sessionAttrs(settings["target_session_attrs"]); err != nil {
+		return nil, err
 	}
 	for key, value := range settings {
 		if !connectionKeys[key] && !clientOnlyKeys[key] {
@@ -192,22 +192,102 @@ func buildConfig(settings map[string]string) (*Config, error) {
 }
 
 func (c *Config) address(settings map[string]string) error {
-	c.Host = settings["host"]
-	if strings.Contains(c.Host, ",") {
-		return fmt.Errorf("%w: more than one host is not supported", ErrInvalidConnString)
+	hosts := strings.Split(settings["host"], ",")
+	ports := strings.Split(settings["port"], ",")
+	if len(ports) != 1 && len(ports) != len(hosts) {
+		return fmt.Errorf("%w: %d ports for %d hosts", ErrInvalidConnString, len(ports), len(hosts))
 	}
-	port := settings["port"]
-	if port == "" {
-		port = "5432"
+	for i, host := range hosts {
+		port, err := parsePort(ports[min(i, len(ports)-1)])
+		if err != nil {
+			return err
+		}
+		if host == "" {
+			host = defaultHost(port)
+		}
+		if i == 0 {
+			c.Host, c.Port = host, port
+			continue
+		}
+		c.Fallbacks = append(c.Fallbacks, &FallbackConfig{Host: host, Port: port})
 	}
-	number, err := strconv.ParseUint(port, 10, 16)
+	return nil
+}
+
+// parsePort reads a port number, 5432 if none is given.
+func parsePort(text string) (uint16, error) {
+	if text == "" {
+		return 5432, nil
+	}
+	number, err := strconv.ParseUint(text, 10, 16)
 	if err != nil || number == 0 {
-		return fmt.Errorf("%w: port is not a port number", ErrInvalidConnString)
+		return 0, fmt.Errorf("%w: port is not a port number", ErrInvalidConnString)
 	}
-	c.Port = uint16(number)
-	if c.Host == "" {
-		c.Host = defaultHost(c.Port)
+	return uint16(number), nil
+}
+
+// cutHosts takes the host part out of a URL, which url.Parse refuses when it
+// lists several hosts, IPv6 among them, and returns the URL without it.
+func cutHosts(text string) (string, string) {
+	scheme, rest, found := strings.Cut(text, "://")
+	if !found {
+		return text, ""
 	}
+	end := strings.IndexAny(rest, "/?")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority := rest[:end]
+	at := strings.LastIndex(authority, "@")
+	return scheme + "://" + authority[:at+1] + rest[end:], authority[at+1:]
+}
+
+// splitHosts splits a URL's host part, host:port,host:port, into a list of
+// hosts and a list of ports, either of which may have empty entries, as
+// key=value strings give them. A host in brackets is an IPv6 address, and one
+// percent-encoded, such as %2Fvar%2Frun%2Fpostgresql, a socket directory.
+func splitHosts(text string) (string, string) {
+	if text == "" {
+		return "", ""
+	}
+	var hosts, ports []string
+	for _, part := range strings.Split(text, ",") {
+		host, port := splitHostPort(part)
+		if unescaped, err := url.PathUnescape(host); err == nil {
+			host = unescaped
+		}
+		hosts, ports = append(hosts, host), append(ports, port)
+	}
+	return strings.Join(hosts, ","), strings.Join(ports, ",")
+}
+
+// splitHostPort splits host:port, or [v6]:port, with the port optional.
+func splitHostPort(text string) (string, string) {
+	if rest, ok := strings.CutPrefix(text, "["); ok {
+		host, port, _ := strings.Cut(rest, "]")
+		return host, strings.TrimPrefix(port, ":")
+	}
+	host, port, _ := strings.Cut(text, ":")
+	return host, port
+}
+
+// sessionAttrs sets ValidateConnect for target_session_attrs.
+func (c *Config) sessionAttrs(attrs string) error {
+	validators := map[string]func(context.Context, *Conn) error{
+		"read-write":     ValidateReadWrite,
+		"read-only":      ValidateReadOnly,
+		"primary":        ValidatePrimary,
+		"standby":        ValidateStandby,
+		"prefer-standby": ValidatePreferStandby,
+	}
+	if attrs == "" || attrs == "any" {
+		return nil
+	}
+	validate, ok := validators[attrs]
+	if !ok {
+		return fmt.Errorf("%w: target_session_attrs %q is not one of any, read-write, read-only, primary, standby, prefer-standby", ErrInvalidConnString, attrs)
+	}
+	c.ValidateConnect = validate
 	return nil
 }
 
@@ -274,42 +354,57 @@ func (c *Config) timeout(text string) error {
 // server, verify-ca checks its certificate chain, verify-full also checks its
 // name. require with a root certificate given verifies the chain, as libpq does.
 func (c *Config) encryption(settings map[string]string) error {
+	var err error
+	if c.TLSConfig, c.TLSFallback, err = hostTLS(c.Host, settings); err != nil {
+		return err
+	}
+	for _, fallback := range c.Fallbacks {
+		if fallback.TLSConfig, fallback.TLSFallback, err = hostTLS(fallback.Host, settings); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hostTLS is the TLS configuration for one host, checked against its name,
+// and whether plaintext is allowed if TLS is not to be had.
+func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error) {
 	mode := settings["sslmode"]
 	if mode == "" {
 		mode = "prefer"
 	}
-	if mode == "disable" || mode == "allow" || c.unix() {
-		return validMode(mode)
+	if mode == "disable" || mode == "allow" || (&Config{Host: host}).unix() {
+		return nil, false, validMode(mode)
 	}
 
-	config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: c.Host}
+	config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
 	if settings["sslsni"] == "0" {
 		config.ServerName = ""
 	}
 	rootFile := settings["sslrootcert"]
 
+	fallback := false
 	switch mode {
 	case "prefer":
 		config.InsecureSkipVerify = true
-		c.TLSFallback = true
+		fallback = true
 	case "require":
 		config.InsecureSkipVerify = rootFile == ""
 	case "verify-ca", "verify-full":
 	default:
-		return validMode(mode)
+		return nil, false, validMode(mode)
 	}
 
 	if err := loadRoots(config, rootFile); err != nil {
-		return err
+		return nil, false, err
 	}
 	if !config.InsecureSkipVerify && mode != "verify-full" {
 		verifyChainOnly(config)
 	}
 	if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"]); err != nil {
-		return err
+		return nil, false, err
 	}
-	c.TLSConfig = config
-	return nil
+	return config, fallback, nil
 }
 
 func validMode(mode string) error {

@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"context"
 	"crypto/tls"
 	"maps"
 	"net"
@@ -80,6 +81,34 @@ type Config struct {
 	// the connection, and should return quickly.
 	OnNotice       func(notice *Error)
 	OnNotification func(notification Notification)
+
+	// Fallbacks are the servers to try, in order, after Host and Port. Connect
+	// moves on to the next when one cannot be reached or refuses the login,
+	// except where the next could not do better: a wrong password (28P01), a
+	// database that does not exist (3D000) or a role without the privilege
+	// (42501), which end the attempt there, as a context that is over does.
+	// ConnectTimeout bounds each server on its own, as libpq's does.
+	Fallbacks []*FallbackConfig
+
+	// DialFunc opens the network connection; nil dials with a net.Dialer
+	// that keeps the connection alive every five minutes. LookupFunc, if set,
+	// resolves a host to the addresses to try, in order, each as a server of
+	// its own; nil leaves that to the dialer, which tries every address of a
+	// host and reports the first that answers.
+	DialFunc   func(ctx context.Context, network, address string) (net.Conn, error)
+	LookupFunc func(ctx context.Context, host string) ([]string, error)
+
+	// ValidateConnect, if set, is asked of each server logged into whether it
+	// is the one wanted; one it refuses is closed and the next is tried. What
+	// target_session_attrs sets is one of these: ValidateReadWrite,
+	// ValidateReadOnly, ValidatePrimary, ValidateStandby or
+	// ValidatePreferStandby. An error that is ErrNotPreferred keeps the
+	// server as a last resort: it is used if none after it is valid.
+	//
+	// AfterConnect, if set, runs on the connection once it is chosen, to set
+	// it up; an error from it closes the connection and fails Connect.
+	ValidateConnect func(ctx context.Context, conn *Conn) error
+	AfterConnect    func(ctx context.Context, conn *Conn) error
 }
 
 // Copy returns a deep copy, safe to adjust for one connection without
@@ -90,7 +119,48 @@ func (c *Config) Copy() *Config {
 	if c.TLSConfig != nil {
 		clone.TLSConfig = c.TLSConfig.Clone()
 	}
+	clone.Fallbacks = make([]*FallbackConfig, len(c.Fallbacks))
+	for i, fallback := range c.Fallbacks {
+		copied := *fallback
+		if fallback.TLSConfig != nil {
+			copied.TLSConfig = fallback.TLSConfig.Clone()
+		}
+		clone.Fallbacks[i] = &copied
+	}
+	if len(clone.Fallbacks) == 0 {
+		clone.Fallbacks = nil
+	}
 	return &clone
+}
+
+// servers is where to connect, in order: Host and Port, then each fallback.
+func (c *Config) servers() []FallbackConfig {
+	servers := make([]FallbackConfig, 0, 1+len(c.Fallbacks))
+	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
+	for _, fallback := range c.Fallbacks {
+		servers = append(servers, *fallback)
+	}
+	return servers
+}
+
+// at is the configuration of a connection to one server: this one, with that
+// server's address and TLS, and no fallbacks of its own, so that what the
+// connection reports as its configuration, and where it sends a cancel
+// request, is the server it is connected to.
+func (c *Config) at(server FallbackConfig) *Config {
+	one := *c
+	one.Host, one.Port = server.Host, server.Port
+	one.TLSConfig, one.TLSFallback = server.TLSConfig, server.TLSFallback
+	one.Fallbacks = nil
+	return &one
+}
+
+// dialer is DialFunc, or a net.Dialer's.
+func (c *Config) dialer() func(ctx context.Context, network, address string) (net.Conn, error) {
+	if c.DialFunc != nil {
+		return c.DialFunc
+	}
+	return (&net.Dialer{KeepAlive: 5 * time.Minute}).DialContext
 }
 
 // minProtocol is the oldest protocol version a connection may use.

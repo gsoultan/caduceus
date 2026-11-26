@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"sort"
 	"time"
 )
@@ -33,19 +32,31 @@ const scramMechanism = "SCRAM-SHA-256"
 // with no deadline.
 const maxLoginMessages = 1024
 
-// Connect dials the server described by config and logs in.
+// Connect dials the server described by config and logs in: Host and Port,
+// or, failing that, each of Fallbacks in turn, until one will have it and
+// ValidateConnect, if set, accepts it. AfterConnect then runs on it. A
+// failure is a *ConnectError for each server tried, joined.
 //
 // With sslmode=prefer, a server that declines TLS or fails the handshake is
 // dialled again in plaintext, as libpq does.
 func Connect(ctx context.Context, config *Config) (*Conn, error) {
-	if config.ConnectTimeout > 0 {
+	a := attempt{config: config}
+	for _, server := range config.servers() {
+		if a.server(ctx, server) {
+			break
+		}
+	}
+	return a.result(ctx)
+}
+
+// connectOnce connects to the one server one names, within ConnectTimeout.
+func connectOnce(ctx context.Context, one *Config) (*Conn, error) {
+	if one.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, config.ConnectTimeout)
+		ctx, cancel = context.WithTimeout(ctx, one.ConnectTimeout)
 		defer cancel()
 	}
-
-	conn, err := dial(ctx, config, config.firstProtocol())
-	return conn, connectError(config, err)
+	return dial(ctx, one, one.firstProtocol())
 }
 
 // dial connects asking for a protocol version, in plaintext once more if
@@ -74,7 +85,7 @@ func ctxErr(err error) error {
 
 func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version ProtocolVersion) (*Conn, error) {
 	network, address := config.target()
-	netConn, err := (&net.Dialer{KeepAlive: 5 * time.Minute}).DialContext(ctx, network, address)
+	netConn, err := config.dialer()(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}

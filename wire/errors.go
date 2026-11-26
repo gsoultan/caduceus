@@ -35,6 +35,16 @@ var (
 	// SCRAM-SHA-256. It says no more than that: the detail would be about a secret.
 	ErrSCRAM = errors.New("caduceus/wire: server failed SCRAM authentication")
 
+	// ErrNotPreferred is what a ValidateConnect returns of a server that will
+	// do, but not as well as one of another kind, as a primary will do for
+	// target_session_attrs=prefer-standby: it is used if no server after it
+	// is preferred.
+	ErrNotPreferred = errors.New("caduceus/wire: the server is not of the kind preferred")
+
+	// ErrSessionAttrs is what ValidateConnect returns of a server that is not
+	// of the kind target_session_attrs asks for.
+	ErrSessionAttrs = errors.New("caduceus/wire: the server is not of the kind target_session_attrs asks for")
+
 	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
 	// string, because the string is where the password is.
 	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")
