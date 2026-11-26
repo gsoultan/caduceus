@@ -236,11 +236,12 @@ func (t *Tx) Rollback(ctx context.Context) error {
 }
 
 // Exec runs a statement inside the transaction.
-func (t *Tx) Exec(ctx context.Context, sql string, args ...any) (string, error) {
+func (t *Tx) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
 	if err := t.usable(); err != nil {
 		return "", err
 	}
-	return t.conn.exec(ctx, sql, args)
+	tag, err := t.conn.exec(ctx, sql, args)
+	return CommandTag(tag), err
 }
 
 // Query runs a query inside the transaction.

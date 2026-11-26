@@ -269,13 +269,13 @@ func (p *PipelineResults) remember(err error) error {
 
 // Exec reads the next statement's result, discarding any rows, and returns
 // its command tag.
-func (p *PipelineResults) Exec() (string, error) {
+func (p *PipelineResults) Exec() (CommandTag, error) {
 	rows := new(Rows)
 	if err := p.statementInto(rows); err != nil {
 		return "", err
 	}
 	rows.Close()
-	return rows.tag, rows.err
+	return CommandTag(rows.tag), rows.err
 }
 
 // Query returns the next statement's rows. Reading the next result, or

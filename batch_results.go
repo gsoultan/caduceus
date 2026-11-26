@@ -205,13 +205,13 @@ func (b *BatchResults) remember(err error) error {
 
 // Exec reads the next statement's result, discarding any rows, and returns
 // its command tag.
-func (b *BatchResults) Exec() (string, error) {
+func (b *BatchResults) Exec() (CommandTag, error) {
 	rows, err := b.statement()
 	if err != nil {
 		return "", err
 	}
 	rows.Close()
-	return rows.tag, rows.err
+	return CommandTag(rows.tag), rows.err
 }
 
 // Query returns the next statement's rows. Reading the next result, or

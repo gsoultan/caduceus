@@ -22,7 +22,8 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | :--- | :--- |
 | **Connect** | URL or key=value strings, `PG*` environment variables, the password file, TLS by `sslmode` (`disable` … `verify-full`), SCRAM-SHA-256, MD5 and cleartext auth, Unix sockets |
 | **Protocol** | 3.2 with PostgreSQL 18 and later, whose cancel key is up to 256 bytes where 3.0's is 4; 3.0 with an older server: PostgreSQL 9.3 to 17 offers 3.0 in a NegotiateProtocolVersion, and a server older still refuses with 0A000. A pooler that refuses 3.2 outright, as PgBouncer before 1.24 does (08P01), is asked again for 3.0. When that succeeds, a `Config` from `ParseConfig` and its copies ask for 3.0 at once for ten minutes, then try 3.2 again, so an upgraded pooler or a failover is found without a restart; a `Config` built by hand does not remember the fallback and dials twice every time, so behind such a pooler parse the `Config` (`ConnectConfig`), or set `max_protocol_version=3.0`. With `min_protocol_version=3.2`, an offer of 3.0 and a refusal of 3.2 both fail with `ErrProtocolVersion`. `min_protocol_version` and `max_protocol_version` (`3.0`, `3.2`, `latest`) bound it, as in libpq 18 |
-| **Query** | `Exec`, `Query`, `QueryRow`, `QueryInto`; parameters always bound server-side, never interpolated |
+| **Query** | `Exec`, `Query`, `QueryRow`, `QueryInto`; parameters always bound server-side, never interpolated. `Exec` returns a `CommandTag`, whose `RowsAffected` counts the rows touched |
+| **Results** | `CollectRows`, `AppendRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`; rows into scalars (`RowTo`), maps (`RowToMap`) and structs by name or position (`RowToStructByName`, `…ByNameLax`, `…ByPos`, and `RowToAddrOf…` for pointers); `Rows.Values` decodes a row to Go values |
 | **Transactions** | `Begin`, `BeginTx` with isolation level, read-only and deferrable; nested transactions as savepoints; idempotent `Commit` / `Rollback` |
 | **Batch** | `SendBatch`: any number of queries as one transaction, in at most two round trips when they fit a 32 KiB window and a window at a time beyond that |
 | **Pipeline** | `SendPipeline`: any number of statements sent without waiting for each reply, each failing on its own; inside a transaction, the fastest way to run many statements |
@@ -116,6 +117,55 @@ a transaction begun and not yet sent as open, and one whose `BEGIN` was
 refused as failed, so a pool that unwinds by that status catches both. Such a
 pool still has to keep its own account of who holds a connection, because the
 status of a transaction ended in SQL is idle.
+
+### Results
+
+```go
+type User struct {
+	ID    int64
+	Login string  `db:"user_name"` // a tag names the column
+	Email *string // NULL leaves it nil
+	Audit         // embedded: its CreatedAt and CreatedBy are matched as User's own
+}
+
+rows, err := conn.Query(ctx, "SELECT id, user_name, email, created_at, created_by FROM users")
+if err != nil {
+	return err
+}
+users, err := caduceus.CollectRows(rows, caduceus.RowToStructByName[User])
+```
+
+Every collecting function closes the rows, whatever happens, so the connection
+is free when it returns, and returns the error that ended them or the first one
+the `RowToFunc` returned, with nothing collected. `CollectOneRow` takes the
+first row and reads the rest off the connection undecoded; it and
+`CollectExactlyOneRow` return `ErrNoRows` for none, and the latter
+`ErrTooManyRows` for a second. `ForEachRow(rows, []any{&id, &name}, fn)` scans
+each row into the same variables and returns the `CommandTag`.
+
+| Function | Each row becomes |
+| :--- | :--- |
+| `RowTo[T]`, `RowToAddrOf[T]` | the one column scanned into a `T`, or a fresh `*T` |
+| `RowToMap` | a fresh `map[string]any`, by column name, decoded as `Rows.Values` decodes it |
+| `RowToStructByName[T]` | a struct, each column into the field of its name: its `db` tag exactly as written, or its Go name without regard to case or underscores, so `UserID` takes `user_id`. Every column needs a field and every field a column |
+| `RowToStructByNameLax[T]` | the same, leaving a field without a column at its zero value |
+| `RowToStructByPos[T]` | a struct, the n-th column into the n-th field; the counts must agree |
+| `RowToAddrOfStruct…[T]` | a fresh `*T` of each of the three |
+
+Only exported fields take columns and `db:"-"` skips one. An embedded struct is
+flattened into its parent, tagged or not, as pgx flattens it, except that
+`db:"-"` skips it too, where pgx flattens it regardless. A struct's own field
+shadows an embedded one of the same name, as in Go: `type User struct{ Base; ID
+int64 }` puts the `id` column into `User.ID`, and `Base.ID`, shadowed, is not
+wanted a column of its own. Which field takes which column is derived once for
+each struct type, mapping and set of column names, and kept for the next row
+and the next query, in a cache safe for concurrent use. Only a mapping that
+works is kept, a by-name one has no more names than its struct has fields, a
+by-position one keeps no names, and the cache holds at most about 1024 of them
+and 1 MiB of their column names: a program handed column names it does not
+choose is never made to hold more, as the cache is emptied each time it fills.
+`Values`, `RowToMap` and the scalar and struct functions all copy what they
+keep, so what they return stays valid after the next row is read.
 
 ### Batch and COPY
 
@@ -356,7 +406,7 @@ reach an application that imports caduceus.
 
 | Package | Contents |
 | :--- | :--- |
-| `caduceus` | `Conn`, `Rows`, `Row`, `Tx`, `BatchResults`, `PipelineResults`, `CopyFrom` |
+| `caduceus` | `Conn`, `Rows`, `Row`, `Tx`, `BatchResults`, `PipelineResults`, `CopyFrom`, `CommandTag`, `CollectRows` and the `RowTo…` functions |
 | `caduceus/wire` | the frontend/backend protocol, version 3.0: config, TLS, auth, framing, errors, cancel, notifications, CopyBoth |
 | `caduceus/codec` | Go values to and from PostgreSQL's text and binary formats |
 | `caduceus/replication` | logical replication: pgoutput decoding, stream messages, LSNs |

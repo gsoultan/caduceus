@@ -9,8 +9,12 @@ var (
 	// read to its end or closed.
 	ErrConnBusy = errors.New("caduceus: connection is busy with an unread result")
 
-	// ErrNoRows is QueryRow's Scan finding no row.
+	// ErrNoRows is QueryRow's Scan, CollectOneRow or CollectExactlyOneRow
+	// finding no row.
 	ErrNoRows = errors.New("caduceus: no rows in result set")
+
+	// ErrTooManyRows is CollectExactlyOneRow finding a second row.
+	ErrTooManyRows = errors.New("caduceus: too many rows in result set")
 
 	// ErrNotOnARow is Scan called before Next, or after Next returned false.
 	ErrNotOnARow = errors.New("caduceus: Scan called without a current row; call Next first")

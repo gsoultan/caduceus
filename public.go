@@ -43,13 +43,15 @@ func New(conn *wire.Conn, options Options) *Conn {
 	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true}
 }
 
-// Exec runs a statement and returns its command tag, such as "UPDATE 3".
+// Exec runs a statement and returns its command tag, such as "UPDATE 3",
+// whose RowsAffected says how many rows it touched.
 //
 // Without arguments it goes over the simple protocol, one round trip that
 // allows several statements separated by semicolons. With arguments they are
 // bound as parameters, never interpolated.
-func (s *Conn) Exec(ctx context.Context, sql string, args ...any) (string, error) {
-	return s.exec(ctx, sql, args)
+func (s *Conn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
+	tag, err := s.exec(ctx, sql, args)
+	return CommandTag(tag), err
 }
 
 // Query runs a query and returns its rows, which are read off the connection

@@ -194,7 +194,7 @@ func (c *Rows) fail(err error) {
 
 // Scan decodes the current row into dest.
 func (c *Rows) Scan(dest ...any) error {
-	if c.ahead || (len(c.values) == 0 && len(c.stmt.fields) > 0) {
+	if !c.onRow() {
 		return ErrNotOnARow
 	}
 	if len(dest) != len(c.values) {
@@ -212,6 +212,12 @@ func (c *Rows) Scan(dest ...any) error {
 	return nil
 }
 
+// onRow reports whether Next has moved onto a row that Scan and Values can
+// read: one Fields read ahead is not yet Next's.
+func (c *Rows) onRow() bool {
+	return !c.ahead && (len(c.values) > 0 || len(c.stmt.fields) == 0)
+}
+
 // columnError says which column could not be scanned, and, for one that
 // arrived in a format chosen for the type it had when the statement was
 // described, that the statement's result changed since then: the statement
@@ -222,6 +228,26 @@ func columnError(field *wire.Field, err error) error {
 		return fmt.Errorf("caduceus: column %q: %w: %w", field.Name, ErrResultChanged, err)
 	}
 	return fmt.Errorf("caduceus: column %q: %w", field.Name, err)
+}
+
+// Values decodes every column of the current row into the Go value that fits
+// it best, as Scan does into a *any: int16, int32, int64, float64, string,
+// []byte, time.Time and so on, and nil for NULL. The slice and everything in
+// it are allocated afresh by each call, so they stay valid after Next.
+func (c *Rows) Values() ([]any, error) {
+	if !c.onRow() {
+		return nil, ErrNotOnARow
+	}
+	values := make([]any, len(c.values))
+	for i, value := range c.values {
+		field := &c.stmt.fields[i]
+		natural, err := codec.Natural(field.DataTypeOID, field.Format, value)
+		if err != nil {
+			return nil, columnError(field, err)
+		}
+		values[i] = natural
+	}
+	return values, nil
 }
 
 // Err returns the error that ended the result, if any.
@@ -270,4 +296,4 @@ func (c *Rows) RawValues() [][]byte {
 }
 
 // Tag returns the command tag, available once the result is over.
-func (c *Rows) Tag() string { return c.tag }
+func (c *Rows) Tag() CommandTag { return CommandTag(c.tag) }
