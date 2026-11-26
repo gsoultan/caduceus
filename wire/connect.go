@@ -25,12 +25,18 @@ const (
 	authSASLFinal    = 12
 )
 
-const scramMechanism = "SCRAM-SHA-256"
+const (
+	scramMechanism     = "SCRAM-SHA-256"
+	scramPlusMechanism = "SCRAM-SHA-256-PLUS"
+)
 
 // maxLoginMessages bounds the exchange before ReadyForQuery, so a server that
 // never finishes logging in cannot keep a dial going for ever on a context
 // with no deadline.
 const maxLoginMessages = 1024
+
+// alpnProtocol is the ALPN protocol a direct TLS connection asks for.
+const alpnProtocol = "postgresql"
 
 // Connect dials the server described by config and logs in: Host and Port,
 // or, failing that, each of Fallbacks in turn, until one will have it and
@@ -40,6 +46,9 @@ const maxLoginMessages = 1024
 // With sslmode=prefer, a server that declines TLS or fails the handshake is
 // dialled again in plaintext, as libpq does.
 func Connect(ctx context.Context, config *Config) (*Conn, error) {
+	if err := config.validAuth(); err != nil {
+		return nil, err
+	}
 	a := attempt{config: config}
 	for _, server := range config.servers() {
 		if a.server(ctx, server) {
@@ -71,9 +80,13 @@ func dial(ctx context.Context, config *Config, version ProtocolVersion) (*Conn, 
 
 // fallbackWorthy reports whether a failure was TLS's rather than the server's
 // verdict on the login, which is the only kind a plaintext retry could cure.
+//
+// A login refused here, for require_auth or channel_binding, is not one:
+// plaintext would be refused the same, or worse, let through unbound.
 func fallbackWorthy(err error) bool {
 	var serverErr *Error
-	return !errors.As(err, &serverErr) && ctxErr(err) == nil
+	refused := errors.Is(err, ErrRequireAuth) || errors.Is(err, ErrChannelBinding)
+	return !errors.As(err, &serverErr) && ctxErr(err) == nil && !refused
 }
 
 func ctxErr(err error) error {
@@ -125,16 +138,18 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version
 }
 
 func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
-	if tlsConfig != nil {
-		if err := c.negotiateTLS(ctx, tlsConfig); err != nil {
-			return err
-		}
+	if err := c.secure(ctx, tlsConfig); err != nil {
+		return err
 	}
 	if _, err := c.netConn.Write(c.startupMessage()); err != nil {
 		return err
 	}
 
-	auth := authenticator{conn: c}
+	policy, err := parseRequireAuth(c.config.RequireAuth)
+	if err != nil {
+		return err
+	}
+	auth := authenticator{conn: c, policy: policy}
 	asked := c.protocol
 	for i := range maxLoginMessages {
 		kind, body, err := c.Receive()
@@ -213,6 +228,35 @@ func (c *Conn) cancelKey(body []byte) bool {
 	return true
 }
 
+// secure starts TLS, if it is to be used: at once with DirectTLS, or once
+// the server has agreed to it.
+func (c *Conn) secure(ctx context.Context, tlsConfig *tls.Config) error {
+	switch {
+	case tlsConfig == nil:
+		return nil
+	case c.config.DirectTLS:
+		return c.directTLS(ctx, tlsConfig)
+	}
+	return c.negotiateTLS(ctx, tlsConfig)
+}
+
+// directTLS starts TLS at once, with the ALPN protocol postgresql, by which
+// the server knows it is not some other protocol's client, and refuses a
+// server that does not answer with it.
+func (c *Conn) directTLS(ctx context.Context, tlsConfig *tls.Config) error {
+	direct := tlsConfig.Clone()
+	direct.NextProtos = []string{alpnProtocol}
+	secured := tls.Client(c.netConn, direct)
+	if err := secured.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	c.netConn = secured
+	if secured.ConnectionState().NegotiatedProtocol != alpnProtocol {
+		return fmt.Errorf("%w: the server did not answer with ALPN %s", ErrTLSRefused, alpnProtocol)
+	}
+	return nil
+}
+
 // negotiateTLS asks for encryption before anything else is sent, so that no
 // credential and no setting crosses in the clear when encryption is available.
 func (c *Conn) negotiateTLS(ctx context.Context, config *tls.Config) error {
@@ -259,11 +303,49 @@ func (c *Conn) startupMessage() []byte {
 	return body
 }
 
-// authenticator answers the server's authentication requests.
+// authenticator answers the server's authentication requests, within what
+// require_auth and channel_binding allow.
 type authenticator struct {
 	conn     *Conn
 	scram    *scramClient
 	verified bool
+	policy   authPolicy
+	// asked is a method asked for, and bound a SCRAM bound to the TLS
+	// connection.
+	asked bool
+	bound bool
+}
+
+// requireBinding reports whether channel_binding is require.
+func (a *authenticator) requireBinding() bool {
+	return a.conn.config.ChannelBinding == "require"
+}
+
+// password checks that the server may ask for the password as method, in
+// the clear or hashed with MD5, before it is sent.
+func (a *authenticator) password(method string) error {
+	a.asked = true
+	if err := a.policy.check(method); err != nil {
+		return err
+	}
+	if a.requireBinding() {
+		return ErrChannelBinding
+	}
+	return nil
+}
+
+// authenticated checks a login the server has declared done: one that
+// asked for nothing must be allowed to, and a binding required was made.
+func (a *authenticator) authenticated() error {
+	if !a.asked {
+		if err := a.policy.check("none"); err != nil {
+			return err
+		}
+	}
+	if a.requireBinding() && !a.bound {
+		return ErrChannelBinding
+	}
+	return nil
 }
 
 func (a *authenticator) handle(body []byte) error {
@@ -273,15 +355,25 @@ func (a *authenticator) handle(body []byte) error {
 	code, data := be32(body), body[4:]
 	switch code {
 	case authOK:
-		return nil
+		return a.authenticated()
 	case authCleartext:
+		if err := a.password("password"); err != nil {
+			return err
+		}
 		return a.send(AppendString(nil, a.conn.config.Password))
 	case authMD5:
 		if len(data) != 4 {
 			return ErrProtocol
 		}
+		if err := a.password("md5"); err != nil {
+			return err
+		}
 		return a.send(AppendString(nil, md5Response(a.conn.config.User, a.conn.config.Password, data)))
 	case authSASL:
+		a.asked = true
+		if err := a.policy.check("scram-sha-256"); err != nil {
+			return err
+		}
 		return a.beginSCRAM(data)
 	case authSASLContinue:
 		return a.continueSCRAM(data)
@@ -307,16 +399,22 @@ func (a *authenticator) send(body []byte) error {
 	return err
 }
 
+// beginSCRAM begins SCRAM with the mechanism scramMechanisms picks.
 func (a *authenticator) beginSCRAM(mechanisms []byte) error {
-	if !offersMechanism(mechanisms, scramMechanism) {
-		return ErrAuthMethod
+	binding := a.conn.serverEndPoint()
+	mechanism, header, err := scramMechanisms(mechanisms, binding, a.conn.config.ChannelBinding)
+	if err != nil {
+		return err
 	}
-	a.scram = &scramClient{password: a.conn.config.Password}
+	a.scram = &scramClient{password: a.conn.config.Password, header: header}
+	if mechanism == scramPlusMechanism {
+		a.scram.binding, a.bound = binding, true
+	}
 	first, err := a.scram.first()
 	if err != nil {
 		return err
 	}
-	body := AppendString(nil, scramMechanism)
+	body := AppendString(nil, mechanism)
 	body = AppendInt32(body, int32(len(first)))
 	return a.send(append(body, first...))
 }
@@ -341,6 +439,29 @@ func (a *authenticator) finishSCRAM(signature []byte) error {
 	}
 	a.verified = true
 	return nil
+}
+
+// scramMechanisms picks the mechanism and its GS2 header: SCRAM-SHA-256-PLUS,
+// bound to the TLS connection, where there is TLS (binding is its
+// tls-server-end-point), the server offers it and channel_binding allows it;
+// SCRAM-SHA-256 otherwise, its header saying whether the client could have
+// bound it, so that a server whose offer of PLUS was struck out on the way can
+// tell. channel_binding=require refuses SCRAM-SHA-256 before anything is
+// sent.
+func scramMechanisms(offered, binding []byte, channelBinding string) (string, string, error) {
+	usable := channelBinding != "disable" && binding != nil
+	plus := usable && offersMechanism(offered, scramPlusMechanism)
+	switch {
+	case plus:
+		return scramPlusMechanism, "p=tls-server-end-point,,", nil
+	case channelBinding == "require":
+		return "", "", ErrChannelBinding
+	case !offersMechanism(offered, scramMechanism):
+		return "", "", ErrAuthMethod
+	case usable:
+		return scramMechanism, "y,,", nil
+	}
+	return scramMechanism, "n,,", nil
 }
 
 // offersMechanism reports whether a NUL-separated list names a mechanism.

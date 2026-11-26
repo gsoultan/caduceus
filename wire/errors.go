@@ -45,6 +45,17 @@ var (
 	// of the kind target_session_attrs asks for.
 	ErrSessionAttrs = errors.New("caduceus/wire: the server is not of the kind target_session_attrs asks for")
 
+	// ErrRequireAuth is returned by Connect when the server asks for an
+	// authentication method that Config.RequireAuth does not allow. Nothing
+	// of the password has been sent.
+	ErrRequireAuth = errors.New("caduceus/wire: the server's authentication method is not allowed by require_auth")
+
+	// ErrChannelBinding is returned by Connect when Config.ChannelBinding is
+	// require and the login would not be bound to the TLS connection: no TLS,
+	// a server that does not offer SCRAM-SHA-256-PLUS, or a method other than
+	// SCRAM. Nothing of the password has been sent.
+	ErrChannelBinding = errors.New("caduceus/wire: channel binding is required and not to be had")
+
 	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
 	// string, because the string is where the password is.
 	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")

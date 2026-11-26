@@ -7,8 +7,12 @@ import (
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"hash"
 	"strconv"
 	"strings"
 )
@@ -31,6 +35,12 @@ const scramNonceLen = 18
 // authenticate.
 type scramClient struct {
 	password string
+	// header is the GS2 header: n,, for no channel binding, y,, for a client
+	// that could bind but was not offered PLUS, p=tls-server-end-point,, for
+	// SCRAM-SHA-256-PLUS, whose binding is the hash of the server's
+	// certificate.
+	header  string
+	binding []byte
 
 	firstBare   string
 	authMessage string
@@ -47,7 +57,7 @@ func (c *scramClient) first() ([]byte, error) {
 	// The username is empty on purpose: PostgreSQL takes it from the startup
 	// packet and ignores this one.
 	c.firstBare = "n=,r=" + base64.StdEncoding.EncodeToString(nonce)
-	return []byte("n,," + c.firstBare), nil
+	return []byte(c.header + c.firstBare), nil
 }
 
 // final consumes the server's challenge and produces the proof.
@@ -79,9 +89,9 @@ func (c *scramClient) final(serverFirst []byte) ([]byte, error) {
 	storedKey := sha256.Sum256(clientKey)
 	c.serverKey = sign(salted, "Server Key")
 
-	// "biws" is the base64 of "n,,": the channel-binding header, repeated so the
-	// server can tell if it was altered on the way.
-	withoutProof := "c=biws,r=" + nonce
+	// The channel-binding header, and the binding, repeated so the server can
+	// tell if either was altered on the way: for n,, this is "biws".
+	withoutProof := "c=" + base64.StdEncoding.EncodeToString(append([]byte(c.header), c.binding...)) + ",r=" + nonce
 	c.authMessage = c.firstBare + "," + text + "," + withoutProof
 
 	proof := sign(storedKey[:], c.authMessage)
@@ -131,4 +141,38 @@ func challengeFields(text string) (nonce, salt, count string, err error) {
 		return "", "", "", ErrSCRAM
 	}
 	return nonce, salt, count, nil
+}
+
+// serverEndPoint is tls-server-end-point's channel binding: the hash of the
+// server's certificate, with the hash its signature uses, and SHA-256 for
+// MD5 and SHA-1, as RFC 5929 says. Nil without TLS, or for a certificate
+// signed with neither, such as Ed25519, which has no such hash.
+func (c *Conn) serverEndPoint() []byte {
+	secured, ok := c.netConn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+	certificates := secured.ConnectionState().PeerCertificates
+	if len(certificates) == 0 {
+		return nil
+	}
+	return endPoint(certificates[0])
+}
+
+// endPoint hashes a certificate for tls-server-end-point.
+func endPoint(certificate *x509.Certificate) []byte {
+	var sum hash.Hash
+	switch certificate.SignatureAlgorithm {
+	case x509.MD5WithRSA, x509.SHA1WithRSA, x509.DSAWithSHA1, x509.ECDSAWithSHA1,
+		x509.SHA256WithRSA, x509.SHA256WithRSAPSS, x509.DSAWithSHA256, x509.ECDSAWithSHA256:
+		sum = sha256.New()
+	case x509.SHA384WithRSA, x509.SHA384WithRSAPSS, x509.ECDSAWithSHA384:
+		sum = sha512.New384()
+	case x509.SHA512WithRSA, x509.SHA512WithRSAPSS, x509.ECDSAWithSHA512:
+		sum = sha512.New()
+	default:
+		return nil
+	}
+	sum.Write(certificate.Raw)
+	return sum.Sum(nil)
 }

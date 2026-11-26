@@ -5,6 +5,7 @@ package wire
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"maps"
 	"net"
 	"strconv"
@@ -40,6 +41,28 @@ type Config struct {
 	// TLSFallback allows a plaintext connection when the server declines TLS or
 	// the handshake fails: libpq's sslmode=prefer, the default.
 	TLSFallback bool
+
+	// DirectTLS starts TLS as soon as the connection is open, with the ALPN
+	// protocol postgresql, rather than asking for it first: libpq's
+	// sslnegotiation=direct, which saves a round trip and needs PostgreSQL 17
+	// or later. It applies only where TLSConfig is set, and a server that
+	// does not answer with ALPN postgresql is refused.
+	DirectTLS bool
+
+	// RequireAuth is libpq's require_auth: the authentication methods the
+	// server may ask for, comma-separated, from password, md5,
+	// scram-sha-256, gss, sspi and none (asking for nothing), or, each
+	// prefixed with !, those it may not. Empty allows any. A method not
+	// allowed fails with ErrRequireAuth before the password is sent.
+	RequireAuth string
+
+	// ChannelBinding is libpq's channel_binding: disable, prefer (the
+	// default, for empty) or require. Over TLS, SCRAM is bound to the
+	// connection as SCRAM-SHA-256-PLUS with tls-server-end-point when the
+	// server offers it, which proves the server that holds the password's
+	// verifier is the one TLS is with; require refuses any login that is
+	// not, with ErrChannelBinding.
+	ChannelBinding string
 
 	// ConnectTimeout bounds dialling and logging in when the caller's context
 	// has no earlier deadline. Zero means only the context bounds it.
@@ -131,6 +154,19 @@ func (c *Config) Copy() *Config {
 		clone.Fallbacks = nil
 	}
 	return &clone
+}
+
+// validAuth checks RequireAuth and ChannelBinding, which a Config built by
+// hand may hold anything in.
+func (c *Config) validAuth() error {
+	if _, err := parseRequireAuth(c.RequireAuth); err != nil {
+		return err
+	}
+	switch c.ChannelBinding {
+	case "", "disable", "prefer", "require":
+		return nil
+	}
+	return fmt.Errorf("%w: channel_binding %q is not one of disable, prefer, require", ErrInvalidConnString, c.ChannelBinding)
 }
 
 // servers is where to connect, in order: Host and Port, then each fallback.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/url"
@@ -35,6 +36,9 @@ func ParseConfig(connString string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := addService(settings); err != nil {
+		return nil, err
+	}
 	addEnvironment(settings)
 	return buildConfig(settings)
 }
@@ -47,6 +51,8 @@ var connectionKeys = map[string]bool{
 	"sslsni": true, "sslpassword": true, "connect_timeout": true, "passfile": true,
 	"target_session_attrs": true, "hostaddr": true,
 	"min_protocol_version": true, "max_protocol_version": true,
+	"require_auth": true, "channel_binding": true, "sslnegotiation": true,
+	"service": true, "servicefile": true,
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -68,6 +74,8 @@ var environment = [][2]string{
 	{"PGTARGETSESSIONATTRS", "target_session_attrs"},
 	{"PGMINPROTOCOLVERSION", "min_protocol_version"},
 	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
+	{"PGREQUIREAUTH", "require_auth"}, {"PGCHANNELBINDING", "channel_binding"},
+	{"PGSSLNEGOTIATION", "sslnegotiation"}, {"PGSSLSNI", "sslsni"},
 }
 
 func parseSettings(text string) (map[string]string, error) {
@@ -180,12 +188,19 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	if err := config.sessionAttrs(settings["target_session_attrs"]); err != nil {
 		return nil, err
 	}
+	config.RequireAuth, config.ChannelBinding = settings["require_auth"], settings["channel_binding"]
+	if err := config.validAuth(); err != nil {
+		return nil, err
+	}
 	for key, value := range settings {
 		if !connectionKeys[key] && !clientOnlyKeys[key] {
 			config.RuntimeParams[key] = value
 		}
 	}
 	if err := config.encryption(settings); err != nil {
+		return nil, err
+	}
+	if err := config.negotiation(settings); err != nil {
 		return nil, err
 	}
 	return config, nil
@@ -401,10 +416,27 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	if !config.InsecureSkipVerify && mode != "verify-full" {
 		verifyChainOnly(config)
 	}
-	if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"]); err != nil {
+	if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"], settings["sslpassword"]); err != nil {
 		return nil, false, err
 	}
 	return config, fallback, nil
+}
+
+// negotiation reads sslnegotiation: postgres, the default, asks for TLS
+// first; direct starts it at once, which libpq allows only where TLS is
+// required, since a server that declines it would be retried in plaintext.
+func (c *Config) negotiation(settings map[string]string) error {
+	switch settings["sslnegotiation"] {
+	case "", "postgres":
+		return nil
+	case "direct":
+		if mode := settings["sslmode"]; mode != "require" && mode != "verify-ca" && mode != "verify-full" {
+			return fmt.Errorf("%w: sslnegotiation=direct needs sslmode require, verify-ca or verify-full", ErrInvalidConnString)
+		}
+		c.DirectTLS = true
+		return nil
+	}
+	return fmt.Errorf("%w: sslnegotiation %q is not one of postgres, direct", ErrInvalidConnString, settings["sslnegotiation"])
 }
 
 func validMode(mode string) error {
@@ -430,19 +462,54 @@ func loadRoots(config *tls.Config, rootFile string) error {
 	return nil
 }
 
-func loadClientCertificate(config *tls.Config, certFile, keyFile string) error {
+func loadClientCertificate(config *tls.Config, certFile, keyFile, password string) error {
 	if (certFile == "") != (keyFile == "") {
 		return fmt.Errorf("%w: sslcert and sslkey must be given together", ErrInvalidConnString)
 	}
 	if certFile == "" {
 		return nil
 	}
-	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		return fmt.Errorf("%w: reading sslcert: %w", ErrInvalidConnString, err)
+	}
+	keyPEM, err := os.ReadFile(keyFile)
+	if err != nil {
+		return fmt.Errorf("%w: reading sslkey: %w", ErrInvalidConnString, err)
+	}
+	if keyPEM, err = decryptKey(keyPEM, password); err != nil {
+		return err
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("%w: loading sslcert: %w", ErrInvalidConnString, err)
 	}
 	config.Certificates = []tls.Certificate{pair}
 	return nil
+}
+
+// decryptKey decrypts a key encrypted the way OpenSSL's traditional format
+// does, with a Proc-Type: 4,ENCRYPTED header, using sslpassword. A key that is
+// not encrypted is returned as it is. PKCS #8 encryption, the BEGIN ENCRYPTED
+// PRIVATE KEY form, is not something the standard library reads; such a key
+// is refused with what to do instead.
+func decryptKey(keyPEM []byte, password string) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
+	switch {
+	case block == nil:
+		return keyPEM, nil
+	case block.Type == "ENCRYPTED PRIVATE KEY":
+		return nil, fmt.Errorf("%w: sslkey is PKCS #8 encrypted, which is not supported; decrypt it, or convert it with openssl pkey -traditional", ErrInvalidConnString)
+	case !x509.IsEncryptedPEMBlock(block): //nolint:staticcheck // the traditional format is what sslpassword decrypts
+		return keyPEM, nil
+	case password == "":
+		return nil, fmt.Errorf("%w: sslkey is encrypted and no sslpassword is given", ErrInvalidConnString)
+	}
+	der, err := x509.DecryptPEMBlock(block, []byte(password)) //nolint:staticcheck // as above
+	if err != nil {
+		return nil, fmt.Errorf("%w: sslkey could not be decrypted with sslpassword", ErrInvalidConnString)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: der}), nil
 }
 
 // verifyChainOnly makes a configuration check that the server's certificate
