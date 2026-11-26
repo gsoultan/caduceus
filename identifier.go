@@ -25,3 +25,18 @@ func QuoteLiteral(s string) string {
 	}
 	return quoted
 }
+
+// Identifier is a name made of parts, such as a schema and a table, as
+// []string{"public", "users"}. Sanitize quotes each part, so a dot inside a
+// part stays part of that name.
+type Identifier []string
+
+// Sanitize renders the identifier for SQL: each part quoted, the parts joined
+// by dots.
+func (ident Identifier) Sanitize() string {
+	quoted := make([]string, len(ident))
+	for i, part := range ident {
+		quoted[i] = QuoteIdentifier(part)
+	}
+	return strings.Join(quoted, ".")
+}

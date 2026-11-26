@@ -41,7 +41,7 @@ func (s *Conn) copyFrom(ctx context.Context, request copyRequest) (int64, error)
 }
 
 func (s *Conn) copyRows(request copyRequest) (int64, error) {
-	table := quoteQualifiedName(request.Table)
+	table := Identifier(request.Table).Sanitize()
 	columns := make([]string, len(request.Columns))
 	for i, column := range request.Columns {
 		columns[i] = QuoteIdentifier(column)
@@ -142,13 +142,4 @@ func sendRows(stream *copyStream, rows CopySource) error {
 func isServerError(err error) bool {
 	var failure *wire.Error
 	return errors.As(err, &failure)
-}
-
-// quoteQualifiedName quotes each part of a possibly schema-qualified name.
-func quoteQualifiedName(parts []string) string {
-	quoted := make([]string, len(parts))
-	for i, part := range parts {
-		quoted[i] = QuoteIdentifier(part)
-	}
-	return strings.Join(quoted, ".")
 }
