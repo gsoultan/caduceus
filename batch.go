@@ -23,6 +23,10 @@ import (
 // wrote megabytes without reading any of the answers would fill the path back,
 // stop the server, and then wait on it for ever.
 func (s *Conn) batch(ctx context.Context, queries []Query) (*BatchResults, error) {
+	queries, err := s.rewrittenAll(ctx, queries)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}

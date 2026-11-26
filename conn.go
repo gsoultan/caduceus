@@ -89,6 +89,10 @@ func (s *Conn) busy() bool { return s.open }
 // separated by semicolons, as a migration script has, unless sql names a
 // statement the caller prepared, which is bound and executed.
 func (s *Conn) exec(ctx context.Context, sql string, args []any) (string, error) {
+	sql, args, err := s.rewritten(ctx, sql, args)
+	if err != nil {
+		return "", err
+	}
 	if err := s.begin(ctx); err != nil {
 		return "", err
 	}
@@ -120,6 +124,10 @@ func (s *Conn) query(ctx context.Context, sql string, args []any) (*Rows, error)
 // queryInto is query with the cursor supplied by the caller, so one that
 // embeds it saves an allocation.
 func (s *Conn) queryInto(ctx context.Context, sql string, args []any, c *Rows) error {
+	sql, args, err := s.rewritten(ctx, sql, args)
+	if err != nil {
+		return err
+	}
 	if err := s.begin(ctx); err != nil {
 		return err
 	}

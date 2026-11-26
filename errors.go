@@ -57,6 +57,11 @@ var (
 	// ErrEmptyBatch is SendBatch or SendPipeline with no queries.
 	ErrEmptyBatch = errors.New("caduceus: batch is empty")
 
+	// ErrNamedArgs is a StrictNamedArgs that does not match its statement: a
+	// name the statement uses that the arguments lack, or one they hold that
+	// it does not use.
+	ErrNamedArgs = errors.New("caduceus: named arguments do not match the statement")
+
 	// ErrNoCopySource is CopyFrom with a nil source of rows.
 	ErrNoCopySource = errors.New("caduceus: CopyFrom needs a source of rows")
 )

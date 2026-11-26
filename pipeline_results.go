@@ -94,6 +94,10 @@ func (s *Conn) SendPipeline(ctx context.Context, queries []Query) (*PipelineResu
 	if len(queries) == 0 {
 		return nil, ErrEmptyBatch
 	}
+	queries, err := s.rewrittenAll(ctx, queries)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}
