@@ -18,6 +18,9 @@ type Transaction struct {
 // parseBegin reads a Begin message after its type byte.
 func parseBegin(body []byte) (Transaction, error) {
 	r := reader{data: body}
-	tx := Transaction{FinalLSN: LSN(r.uint64()), Committed: r.timestamp(), XID: r.uint32()}
-	return tx, r.err
+	m, _ := r.message(msgBegin, false).(*BeginMessage)
+	if r.err != nil {
+		return Transaction{}, r.err
+	}
+	return Transaction{FinalLSN: m.FinalLSN, Committed: m.CommitTime, XID: m.Xid}, nil
 }
