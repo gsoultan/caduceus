@@ -116,9 +116,9 @@ func flushBefore(buf []byte, mark int) []byte {
 	return buf
 }
 
-// prepareBatch finds a statement for every query, asking the server about
-// those the cache does not know, which also parses there the ones that are
-// kept there.
+// prepareBatch finds a statement for every query, by the name of one the
+// caller prepared or by its text, asking the server about those the cache does
+// not know, which also parses there the ones that are kept there.
 func (s *Conn) prepareBatch(queries []Query) ([]*statement, error) {
 	if sameSQL(queries) {
 		queries = queries[:1]
@@ -127,7 +127,7 @@ func (s *Conn) prepareBatch(queries []Query) ([]*statement, error) {
 	var missing []*statement
 	bySQL := map[string]*statement{}
 	for i, query := range queries {
-		stmts[i] = s.cache.get(query.SQL)
+		stmts[i] = s.known(query.SQL)
 		if stmts[i] == nil {
 			stmts[i] = bySQL[query.SQL]
 		}

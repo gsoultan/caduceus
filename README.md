@@ -30,6 +30,7 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **COPY** | `CopyFrom` streams rows in 64 KiB chunks, in binary where the column types allow it |
 | **LISTEN/NOTIFY** | `WaitForNotification`, which never aborts a connection on timeout |
 | **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection |
+| **Prepared statements** | `Prepare` and `Tx.Prepare` return a `StatementDescription` (parameter OIDs, result fields); every way of running a statement runs a prepared one given its name, with no Parse; `Deallocate`, `DeallocateAll`. Kept apart from the statement cache, which never evicts them, and on the server whatever the options |
 | **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
 | **Types** | integers, floats, numeric, bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, arrays; `codec.Scanner` and `codec.Valuer` for your own types; a pointer destination receives NULL |
 | **Errors** | `*wire.Error` with the SQLSTATE and every field the server sends; classify by `SQLState()`, never by message text |
@@ -167,6 +168,39 @@ choose is never made to hold more, as the cache is emptied each time it fills.
 `Values`, `RowToMap` and the scalar and struct functions all copy what they
 keep, so what they return stays valid after the next row is read.
 
+### Prepared statements
+
+```go
+sd, err := conn.Prepare(ctx, "user_by_id", "SELECT id, login FROM users WHERE id = $1")
+// sd.ParamOIDs, sd.Fields: what the server said of the statement.
+row := conn.QueryRow(ctx, "user_by_id", 42) // Bind and Execute, no Parse
+```
+
+The name stands in for the SQL in `Exec`, `Query`, `QueryRow`, `QueryInto`,
+`SendBatch` and `SendPipeline`, on the connection and on a `Tx`. An empty name
+names the statement by its text. Preparing a name again with the same text
+costs nothing; with another text the server refuses it with 42P05, as in pgx,
+and the statement already prepared under the name stays and keeps running by
+it: `Deallocate` the name first to give it another text. A statement the server reports out of date, with
+0A000 after a table changed under it, keeps failing until it is prepared
+again, which then parses it afresh; the driver never closes it on its own.
+`Deallocate` closes one, and is no error for a name not prepared;
+`DeallocateAll` closes them all and forgets the statement cache as well.
+Nothing bounds how many a connection holds: each costs memory in the client
+and in the server backend, for every connection of a pool. SQL built at run
+time belongs in the statement cache, which is capped, not in
+`Prepare(ctx, "", sql)`, unless each such `Prepare` is paired with a
+`Deallocate`.
+
+The cache is separate: it names its statements itself, never evicts a
+caller's and never takes a caller's name, even one that looks like its own.
+A name longer than the server's 63 bytes, or one that is the SQL text, is
+given a digest name on the server, which `StatementDescription.Name` reports.
+Parse is not transactional: a statement prepared in a transaction that rolls
+back stays prepared, and `Tx.Prepare` sends the transaction's waiting `BEGIN`
+along with its Parse. Behind a pooler in transaction mode a statement lives on
+one server connection only, so prepare and run it inside one transaction.
+
 ### Batch and COPY
 
 ```go
@@ -293,6 +327,11 @@ statement is parsed and planned every time it runs. A pipeline outside a
 transaction has every statement parsed for that reason, each being a Sync of
 its own; in a batch, or in a pipeline inside a transaction, a run of the same
 statement shares one Parse.
+
+`Prepare` keeps its statement on the server whatever the options, so behind
+such a pooler a prepared statement is safe only within the transaction that
+prepared it: the next transaction may be lent another server connection,
+which has no such statement or, worse, another client's of the same name.
 
 ## Concurrency
 

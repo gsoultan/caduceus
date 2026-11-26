@@ -22,6 +22,13 @@ type statement struct {
 	// agree, one per column otherwise.
 	formats []int16
 
+	// prepared is a statement the caller prepared by name, which lives outside
+	// the cache and is never closed by the connection on its own: an error
+	// that says it no longer holds marks it stale instead, so that preparing
+	// it again parses it afresh.
+	prepared bool
+	stale    bool
+
 	// prev and next link the statement into its cache's recency list.
 	prev, next *statement
 }

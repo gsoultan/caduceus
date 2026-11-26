@@ -48,7 +48,10 @@ func New(conn *wire.Conn, options Options) *Conn {
 //
 // Without arguments it goes over the simple protocol, one round trip that
 // allows several statements separated by semicolons. With arguments they are
-// bound as parameters, never interpolated.
+// bound as parameters, never interpolated. sql may instead be the name of a
+// statement prepared with Prepare, which is then run with args, any number of
+// them, as this method, Query, QueryRow, QueryInto, SendBatch and
+// SendPipeline all do.
 func (s *Conn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
 	tag, err := s.exec(ctx, sql, args)
 	return CommandTag(tag), err
@@ -141,10 +144,11 @@ func (s *Conn) TxStatus() byte { return s.txStatus() }
 func (s *Conn) IsClosed() bool { return s.conn.IsClosed() }
 
 // ForgetStatements drops everything the connection knows of statements without
-// telling the server: the prepared statements it keeps there, for when the
-// server has already dropped them, as DISCARD ALL does, and what it remembers
-// of statements it does not keep there, which was learned in a session that
-// has since been reset.
+// telling the server: the prepared statements it keeps there, those of the
+// cache and those prepared with Prepare alike, for when the server has already
+// dropped them, as DISCARD ALL does, and what it remembers of statements it
+// does not keep there, which was learned in a session that has since been
+// reset.
 func (s *Conn) ForgetStatements() { s.forgetStatements() }
 
 // Wire returns the underlying protocol connection, for what Conn does not

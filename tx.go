@@ -276,6 +276,22 @@ func (t *Tx) CopyFrom(ctx context.Context, table, columns []string, rows CopySou
 	return t.conn.CopyFrom(ctx, table, columns, rows)
 }
 
+// Prepare prepares a statement as Conn.Prepare does, inside the transaction:
+// a BEGIN still waiting is sent in front of the Parse, in the same round
+// trip, so the transaction is open on the server once a Prepare that parsed
+// returns. One that returns what is held already sends nothing, and the BEGIN
+// waits on for the next statement. The statement belongs to the session, not to
+// the transaction. Parse is not transactional, so the statement stays
+// prepared when the transaction is rolled back, and is run by name on the
+// connection after it as well as in it. A Parse the server refuses fails the
+// transaction, as any statement that fails in one does.
+func (t *Tx) Prepare(ctx context.Context, name, sql string) (*StatementDescription, error) {
+	if err := t.usable(); err != nil {
+		return nil, err
+	}
+	return t.conn.Prepare(ctx, name, sql)
+}
+
 // Conn returns the connection the transaction runs on.
 func (t *Tx) Conn() *Conn { return t.conn }
 

@@ -29,6 +29,10 @@ type Conn struct {
 	// sent ahead of the next Parse, so eviction costs no round trip of its own.
 	closing []string
 	named   uint64
+	// prepared holds the statements the caller prepared, by the name they run
+	// by. They are kept apart from the cache, which can neither evict them nor
+	// give a statement of its own a name of theirs.
+	prepared map[string]*statement
 
 	open  bool
 	guard wire.Guard
@@ -82,12 +86,13 @@ func (s *Conn) busy() bool { return s.open }
 
 // exec runs a statement and discards its rows. Without arguments it goes over
 // the simple protocol, which is one round trip and allows several statements
-// separated by semicolons, as a migration script has.
+// separated by semicolons, as a migration script has, unless sql names a
+// statement the caller prepared, which is bound and executed.
 func (s *Conn) exec(ctx context.Context, sql string, args []any) (string, error) {
 	if err := s.begin(ctx); err != nil {
 		return "", err
 	}
-	if len(args) == 0 {
+	if len(args) == 0 && s.prepared[sql] == nil {
 		tag, err := s.simpleBehindBegin(sql)
 		return tag, s.finish(err)
 	}
@@ -166,12 +171,23 @@ var errCopyOut = errors.New("caduceus: COPY TO STDOUT is not supported through E
 // prepare returns the statement for sql, asking the server what it takes and
 // returns unless the cache already knows: one round trip on a miss and none on
 // a hit. A statement that is kept on the server is parsed there by the same
-// round trip.
+// round trip. sql may also be the name of a statement the caller prepared.
 func (s *Conn) prepare(sql string) (*statement, error) {
-	if stmt := s.cache.get(sql); stmt != nil {
+	if stmt := s.known(sql); stmt != nil {
 		return stmt, nil
 	}
-	name := s.nextName()
+	stmt, err := s.parse(s.nextName(), sql)
+	if err != nil {
+		return nil, err
+	}
+	s.remember(stmt)
+	return stmt, nil
+}
+
+// parse parses and describes sql as the statement name, behind the closes
+// queued and a transaction's BEGIN still waiting, and reads what the server
+// says of it.
+func (s *Conn) parse(name, sql string) (*statement, error) {
 	buf := s.appendBegin(s.closeEvicted(s.conn.Buffer()))
 	buf = wire.AppendParse(buf, name, sql, nil)
 	buf = wire.AppendDescribe(buf, 'S', name)
@@ -180,12 +196,7 @@ func (s *Conn) prepare(sql string) (*statement, error) {
 	if err := s.conn.Send(buf); err != nil {
 		return nil, err
 	}
-	stmt, err := s.readDescription(name, sql)
-	if err != nil {
-		return nil, err
-	}
-	s.remember(stmt)
-	return stmt, nil
+	return s.readDescription(name, sql)
 }
 
 // nextName returns the name for a statement about to be parsed: a new one, or
@@ -377,9 +388,20 @@ func (s *Conn) drain(stmt *statement) (string, error) {
 func (s *Conn) serverError(stmt *statement, body []byte, bound bool) error {
 	failure := wire.ParseError(body)
 	if stmt != nil && !s.refused && outdated(stmt, failure.Code, bound) {
-		s.forget(stmt)
+		s.outdate(stmt)
 	}
 	return failure
+}
+
+// outdate forgets a statement the server says no longer holds, or, for one
+// the caller prepared, which only the caller closes, marks it stale, so that
+// preparing it again parses it afresh.
+func (s *Conn) outdate(stmt *statement) {
+	if stmt.prepared {
+		stmt.stale = true
+		return
+	}
+	s.forget(stmt)
 }
 
 // broken closes a connection whose stream no longer says what was expected of
@@ -411,10 +433,11 @@ func outdated(stmt *statement, code string, bound bool) bool {
 	return !bound
 }
 
-// forgetStatements drops every cached statement, for after a reset that
-// deallocated them on the server.
+// forgetStatements drops every statement, cached or prepared by the caller,
+// for after a reset that deallocated them on the server.
 func (s *Conn) forgetStatements() {
 	s.cache.clear()
+	clear(s.prepared)
 	s.closing = s.closing[:0]
 }
 
