@@ -26,7 +26,15 @@ func (s *Conn) rewritten(ctx context.Context, sql string, args []any) (string, [
 	if !ok {
 		return sql, args, nil
 	}
-	return rewriter.RewriteQuery(ctx, s, sql, args)
+	return s.rewrite(ctx, rewriter, sql)
+}
+
+// rewrite calls rewriter with an argument slice of its own. Handing it the
+// caller's would make that slice escape on every call, a rewriter or not:
+// QueryRow then allocated its variadic arguments, one allocation more for
+// every statement.
+func (s *Conn) rewrite(ctx context.Context, rewriter QueryRewriter, sql string) (string, []any, error) {
+	return rewriter.RewriteQuery(ctx, s, sql, []any{rewriter})
 }
 
 // rewrittenAll applies rewritten to each query of a batch, in a copy of the

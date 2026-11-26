@@ -152,3 +152,22 @@ func TestLiveNamedArgs(t *testing.T) {
 		check("after a refused rewrite", conn.QueryRow(ctx, sql, args))
 	}
 }
+
+// Checking for a rewriter used to hand the caller's arguments to an
+// interface method, which made every variadic argument slice escape: QueryRow
+// went from one allocation to two whether a rewriter was given or not.
+func TestLiveRewriteCheckAllocatesNothing(t *testing.T) {
+	conn := liveConn(t, Options{})
+	// A context that can be cancelled costs allocations of its own to watch;
+	// this one cannot, as in the benchmarks.
+	ctx := context.Background()
+	var n int64
+	allocs := testing.AllocsPerRun(200, func() {
+		if err := conn.QueryRow(ctx, "SELECT $1::int8", int64(7)).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("QueryRow allocates %v times, want at most 1", allocs)
+	}
+}
