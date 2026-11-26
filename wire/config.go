@@ -70,6 +70,16 @@ type Config struct {
 	// 3.2.
 	MinProtocolVersion ProtocolVersion
 	MaxProtocolVersion ProtocolVersion
+
+	// OnNotice is called with each notice the server sends: a WARNING, or
+	// the NOTICE of a RAISE NOTICE, which has the fields of an error and is
+	// not one. Nil drops them. OnNotification is called with each
+	// notification of a channel the connection LISTENs to, which is then not
+	// queued for WaitForNotification. Both run on the goroutine reading the
+	// connection, in the middle of whatever it is reading: they must not use
+	// the connection, and should return quickly.
+	OnNotice       func(notice *Error)
+	OnNotification func(notification Notification)
 }
 
 // Copy returns a deep copy, safe to adjust for one connection without

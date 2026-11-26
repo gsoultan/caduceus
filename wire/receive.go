@@ -9,7 +9,9 @@ import (
 )
 
 // Receive returns the next message, handling the asynchronous ones on the way:
-// a ParameterStatus is recorded, a NotificationResponse queued, a notice dropped.
+// a ParameterStatus is recorded, a NotificationResponse handed to
+// Config.OnNotification or else queued, a notice handed to Config.OnNotice or
+// else dropped.
 //
 // The body aliases the connection's buffer and is valid only until the next
 // call. An ErrorResponse is returned as a message, for the caller to decide what
@@ -27,10 +29,9 @@ func (c *Conn) Receive() (byte, []byte, error) {
 		case MsgParameterStatus:
 			c.recordParameter(body)
 		case MsgNotification:
-			if note, ok := parseNotification(body); ok {
-				c.notifications = append(c.notifications, note)
-			}
+			c.notified(body)
 		case MsgNoticeResponse:
+			c.noticed(body)
 		case MsgReadyForQuery:
 			if len(body) != 1 {
 				return 0, nil, c.fail(ErrProtocol)
@@ -42,6 +43,25 @@ func (c *Conn) Receive() (byte, []byte, error) {
 		default:
 			return kind, body, nil
 		}
+	}
+}
+
+// notified hands a NotificationResponse to OnNotification, or queues it.
+func (c *Conn) notified(body []byte) {
+	note, ok := parseNotification(body)
+	switch {
+	case !ok:
+	case c.config.OnNotification != nil:
+		c.config.OnNotification(note)
+	default:
+		c.notifications = append(c.notifications, note)
+	}
+}
+
+// noticed hands a NoticeResponse to OnNotice.
+func (c *Conn) noticed(body []byte) {
+	if c.config.OnNotice != nil {
+		c.config.OnNotice(parseError(body))
 	}
 }
 

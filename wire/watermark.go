@@ -134,16 +134,14 @@ func (w *watermark) socket(c *Conn) syscall.RawConn {
 	if c.config.noWatermark() || !lowWaterWakes() {
 		return nil
 	}
+	// The mark is for TCP: over a Unix socket a long result is a copy in
+	// memory, with nothing to coalesce.
 	conn := c.netConn
 	if wrapped, ok := conn.(*tls.Conn); ok {
 		conn = wrapped.NetConn()
 	}
-	tcp, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil
-	}
-	if raw, err := tcp.SyscallConn(); err == nil {
-		w.raw = raw
+	if _, ok := conn.(*net.TCPConn); ok {
+		w.raw = rawSocket(conn)
 	}
 	return w.raw
 }
