@@ -41,6 +41,12 @@ type Options struct {
 	// type was asked for in; and an error before the server has bound the
 	// statement forgets it.
 	DescriptionCacheCapacity int
+
+	// Tracer, if set, is told of every statement the connection runs; see
+	// QueryTracer. A tracer that is also a BatchTracer, a CopyFromTracer, a
+	// PrepareTracer or a ConnectTracer is told of those too. A connection
+	// without one pays a nil check for it and nothing more.
+	Tracer QueryTracer
 }
 
 // statements is how many statements to keep on the server: none when the

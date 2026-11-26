@@ -48,6 +48,11 @@ type Conn struct {
 	refused  bool
 	epoch    uint64
 
+	// trace is Options.Tracer, sorted into the kinds of tracer it is, and
+	// traced the context of the trace of a query whose rows are open.
+	trace  tracers
+	traced context.Context
+
 	// lastTag is the previous command tag, reused when the next one has the
 	// same text, as it does for every run of the same statement.
 	lastTag string
@@ -89,6 +94,18 @@ func (s *Conn) busy() bool { return s.open }
 // separated by semicolons, as a migration script has, unless sql names a
 // statement the caller prepared, which is bound and executed.
 func (s *Conn) exec(ctx context.Context, sql string, args []any) (string, error) {
+	tracer := s.trace.query
+	if tracer == nil {
+		return s.execute(ctx, sql, args)
+	}
+	ctx = tracer.TraceQueryStart(ctx, s, queryStart(sql, args))
+	tag, err := s.execute(ctx, sql, args)
+	tracer.TraceQueryEnd(ctx, s, TraceQueryEndData{CommandTag: CommandTag(tag), Err: err})
+	return tag, err
+}
+
+// execute is exec without its tracer.
+func (s *Conn) execute(ctx context.Context, sql string, args []any) (string, error) {
 	sql, args, err := s.rewritten(ctx, sql, args)
 	if err != nil {
 		return "", err
@@ -124,6 +141,35 @@ func (s *Conn) query(ctx context.Context, sql string, args []any) (*Rows, error)
 // queryInto is query with the cursor supplied by the caller, so one that
 // embeds it saves an allocation.
 func (s *Conn) queryInto(ctx context.Context, sql string, args []any, c *Rows) error {
+	tracer := s.trace.query
+	if tracer == nil {
+		return s.openRows(ctx, sql, args, c)
+	}
+	ctx = tracer.TraceQueryStart(ctx, s, queryStart(sql, args))
+	if err := s.openRows(ctx, sql, args, c); err != nil {
+		tracer.TraceQueryEnd(ctx, s, TraceQueryEndData{Err: err})
+		return err
+	}
+	// The query ends when its rows do. It is the connection's only open
+	// exchange, so the connection holds its trace, which spares every Rows a
+	// field of its own.
+	s.traced = ctx
+	return nil
+}
+
+// traceRowsEnd tells the tracer that the traced query whose rows c are has
+// ended. Nothing else can be open while they are, so a traced query is theirs.
+func (s *Conn) traceRowsEnd(c *Rows) {
+	if s.traced == nil {
+		return
+	}
+	ctx := s.traced
+	s.traced = nil
+	s.trace.query.TraceQueryEnd(ctx, s, TraceQueryEndData{CommandTag: CommandTag(c.tag), Err: c.err})
+}
+
+// openRows is queryInto without its tracer.
+func (s *Conn) openRows(ctx context.Context, sql string, args []any, c *Rows) error {
 	sql, args, err := s.rewritten(ctx, sql, args)
 	if err != nil {
 		return err

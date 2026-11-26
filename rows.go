@@ -183,6 +183,7 @@ func (c *Rows) settle(err error) {
 	if finished := c.session.finish(err); finished != nil && c.err == nil {
 		c.err = finished
 	}
+	c.session.traceRowsEnd(c)
 }
 
 // fail ends the exchange on an error of the connection. What is kept is what

@@ -83,6 +83,9 @@ type PipelineResults struct {
 	failure error
 	settled bool
 	closed  bool
+	// traced is the context of the pipeline's trace, until its tracer is
+	// told the pipeline has ended.
+	traced context.Context
 }
 
 // SendPipeline sends queries without waiting for each reply and returns their
@@ -94,6 +97,22 @@ func (s *Conn) SendPipeline(ctx context.Context, queries []Query) (*PipelineResu
 	if len(queries) == 0 {
 		return nil, ErrEmptyBatch
 	}
+	tracer := s.trace.batch
+	if tracer == nil {
+		return s.pipeline(ctx, queries)
+	}
+	ctx = tracer.TraceBatchStart(ctx, s, TraceBatchStartData{Queries: queries})
+	results, err := s.pipeline(ctx, queries)
+	if err != nil {
+		tracer.TraceBatchEnd(ctx, s, TraceBatchEndData{Err: err})
+		return nil, err
+	}
+	results.traced = ctx
+	return results, nil
+}
+
+// pipeline is SendPipeline without its tracer.
+func (s *Conn) pipeline(ctx context.Context, queries []Query) (*PipelineResults, error) {
 	queries, err := s.rewrittenAll(ctx, queries)
 	if err != nil {
 		return nil, err
@@ -303,6 +322,16 @@ func (p *PipelineResults) QueryRow() *Row {
 // error of the whole pipeline. It is idempotent, and the connection is free
 // once it returns.
 func (p *PipelineResults) Close() error {
+	err := p.close()
+	if ctx := p.traced; ctx != nil {
+		p.traced = nil
+		p.session.trace.batch.TraceBatchEnd(ctx, p.session, TraceBatchEndData{Err: err})
+	}
+	return err
+}
+
+// close is Close without its tracer.
+func (p *PipelineResults) close() error {
 	if p.closed {
 		return p.failure
 	}

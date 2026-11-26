@@ -54,24 +54,38 @@ const generatedPrefix = "caduceus_"
 // A Parse the server refuses returns its *wire.Error and prepares nothing; a
 // statement already held under name is left as it was, unless it was stale.
 func (s *Conn) Prepare(ctx context.Context, name, sql string) (*StatementDescription, error) {
+	tracer := s.trace.prepare
+	if tracer == nil {
+		description, _, err := s.prepareNamed(ctx, name, sql)
+		return description, err
+	}
+	ctx = tracer.TracePrepareStart(ctx, s, TracePrepareStartData{Name: name, SQL: sql})
+	description, already, err := s.prepareNamed(ctx, name, sql)
+	tracer.TracePrepareEnd(ctx, s, TracePrepareEndData{AlreadyPrepared: already, Err: err})
+	return description, err
+}
+
+// prepareNamed is Prepare without its tracer, and reports whether the
+// statement was held already, which sends nothing.
+func (s *Conn) prepareNamed(ctx context.Context, name, sql string) (*StatementDescription, bool, error) {
 	if name == "" {
 		name = sql
 	}
 	held := s.prepared[name]
 	if current(held, sql) {
-		return describe(held), nil
+		return describe(held), true, nil
 	}
 	if err := s.begin(ctx); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.releaseStale(name, held)
 	stmt, err := s.parse(serverName(name, sql), sql)
 	if err = s.finish(err); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	stmt.prepared = true
 	s.keep(name, stmt)
-	return describe(stmt), nil
+	return describe(stmt), false, nil
 }
 
 // Deallocate closes the statement prepared as name, on the server and here.

@@ -3,6 +3,7 @@
 package caduceus
 
 import (
+	"context"
 	"errors"
 
 	"github.com/gsoultan/caduceus/wire"
@@ -32,6 +33,9 @@ type BatchResults struct {
 	current *Rows
 	failure error
 	settled bool
+	// traced is the context of the batch's trace, until its tracer is told
+	// the batch has ended.
+	traced context.Context
 }
 
 // sendWindow writes the next window of a batch sent in parts.
@@ -229,4 +233,11 @@ func (b *BatchResults) QueryRow() *Row {
 
 // Close reads every remaining result and returns the batch's first error.
 // It is idempotent, and the connection is free once it returns.
-func (b *BatchResults) Close() error { return b.close() }
+func (b *BatchResults) Close() error {
+	err := b.close()
+	if ctx := b.traced; ctx != nil {
+		b.traced = nil
+		b.session.trace.batch.TraceBatchEnd(ctx, b.session, TraceBatchEndData{Err: err})
+	}
+	return err
+}

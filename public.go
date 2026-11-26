@@ -24,6 +24,18 @@ func Connect(ctx context.Context, connString string, options Options) (*Conn, er
 // ConnectConfig connects with a parsed configuration. A pool that opens many
 // connections parses once and passes a Copy of the config to each.
 func ConnectConfig(ctx context.Context, config *wire.Config, options Options) (*Conn, error) {
+	tracer, _ := options.Tracer.(ConnectTracer)
+	if tracer == nil {
+		return connect(ctx, config, options)
+	}
+	ctx = tracer.TraceConnectStart(ctx, TraceConnectStartData{Config: config})
+	conn, err := connect(ctx, config, options)
+	tracer.TraceConnectEnd(ctx, TraceConnectEndData{Conn: conn, Err: err})
+	return conn, err
+}
+
+// connect is ConnectConfig without its tracer.
+func connect(ctx context.Context, config *wire.Config, options Options) (*Conn, error) {
 	conn, err := wire.Connect(ctx, config)
 	if err != nil {
 		return nil, err
@@ -37,10 +49,11 @@ func ConnectConfig(ctx context.Context, config *wire.Config, options Options) (*
 // one caller, and an application that shares one between goroutines must
 // serialise them itself.
 func New(conn *wire.Conn, options Options) *Conn {
+	trace := newTracers(options.Tracer)
 	if n := options.statements(); n > 0 {
-		return &Conn{conn: conn, cache: newStatementCache(n)}
+		return &Conn{conn: conn, cache: newStatementCache(n), trace: trace}
 	}
-	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true}
+	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true, trace: trace}
 }
 
 // Exec runs a statement and returns its command tag, such as "UPDATE 3",
@@ -90,7 +103,18 @@ func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, e
 	if len(queries) == 0 {
 		return nil, ErrEmptyBatch
 	}
-	return s.batch(ctx, queries)
+	tracer := s.trace.batch
+	if tracer == nil {
+		return s.batch(ctx, queries)
+	}
+	ctx = tracer.TraceBatchStart(ctx, s, TraceBatchStartData{Queries: queries})
+	results, err := s.batch(ctx, queries)
+	if err != nil {
+		tracer.TraceBatchEnd(ctx, s, TraceBatchEndData{Err: err})
+		return nil, err
+	}
+	results.traced = ctx
+	return results, nil
 }
 
 // CopyFrom streams rows into a table with COPY and returns how many it copied.
@@ -111,7 +135,14 @@ func (s *Conn) SendBatch(ctx context.Context, queries []Query) (*BatchResults, e
 // the rows, or rolls it back if the copy fails. Inside one it is part of the
 // caller's, and a copy that fails leaves that transaction failed.
 func (s *Conn) CopyFrom(ctx context.Context, table, columns []string, rows CopySource) (int64, error) {
-	return s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
+	tracer := s.trace.copy
+	if tracer == nil {
+		return s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
+	}
+	ctx = tracer.TraceCopyFromStart(ctx, s, TraceCopyFromStartData{TableName: table, ColumnNames: columns})
+	copied, err := s.copyFrom(ctx, copyRequest{Table: table, Columns: columns, Rows: rows})
+	tracer.TraceCopyFromEnd(ctx, s, TraceCopyFromEndData{Rows: copied, Err: err})
+	return copied, err
 }
 
 // WaitForNotification blocks until a NOTIFY arrives on a channel the
