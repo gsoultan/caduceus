@@ -78,6 +78,9 @@ type Conn struct {
 	// it is a reply left unread, which the exchange's Guard answers by closing
 	// the connection.
 	overdue bool
+	// wrote is anything written since Watch, which is what makes an exchange
+	// that failed unsafe to retry.
+	wrote bool
 
 	closed atomic.Bool
 }
@@ -119,7 +122,8 @@ func (c *Conn) Send(messages []byte) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	_, err := c.netConn.Write(messages)
+	n, err := c.netConn.Write(messages)
+	c.wrote = c.wrote || n > 0
 	if cap(messages) <= shrinkAbove {
 		c.wbuf = messages[:0]
 	} else {
@@ -137,7 +141,9 @@ func (c *Conn) Write(messages []byte) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if _, err := c.netConn.Write(messages); err != nil {
+	n, err := c.netConn.Write(messages)
+	c.wrote = c.wrote || n > 0
+	if err != nil {
 		return c.unsent(err)
 	}
 	return nil

@@ -5,6 +5,7 @@ package caduceus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/gsoultan/caduceus/codec"
@@ -59,17 +60,24 @@ type Conn struct {
 }
 
 // begin opens an exchange guarded by ctx.
+//
+// What it refuses was never sent, which SafeToRetry says of it: a busy
+// connection, a closed one, a transaction whose BEGIN the server refused, and
+// a context already over, which leaves the connection as it was.
 func (s *Conn) begin(ctx context.Context) error {
 	if s.open {
-		return ErrConnBusy
+		return wire.NotSent(ErrConnBusy)
+	}
+	if ctx.Err() != nil {
+		return wire.NotSent(fmt.Errorf("caduceus: %w", context.Cause(ctx)))
 	}
 	if s.conn.IsClosed() {
-		return wire.ErrClosed
+		return wire.NotSent(wire.ErrClosed)
 	}
 	if s.refused {
 		// The server has no transaction open and the caller believes it is in
 		// one: whatever ran now would run on its own and stay committed.
-		return ErrTxNotBegun
+		return wire.NotSent(ErrTxNotBegun)
 	}
 	s.guard = s.conn.Watch(ctx)
 	s.open = true

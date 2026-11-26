@@ -27,7 +27,7 @@ type Guard struct {
 // is blocked, that call returns a timeout, which Done turns into ctx's error.
 func (c *Conn) Watch(ctx context.Context) Guard {
 	g := Guard{conn: c, ctx: ctx}
-	c.overdue = false
+	c.overdue, c.wrote = false, false
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetDeadline(deadline)
 		g.deadline = true
@@ -56,7 +56,17 @@ func (c *Conn) Watch(ctx context.Context) Guard {
 //
 // An error that only happens to be a timeout, with the connection's own reads
 // and writes all on time, is the exchange's business and is returned as it is.
+//
+// An error of an exchange that wrote nothing is marked for SafeToRetry.
 func (g Guard) Done(err error) error {
+	if err = g.done(err); err != nil && !g.conn.wrote {
+		return NotSent(err)
+	}
+	return err
+}
+
+// done is Done without marking the error.
+func (g Guard) done(err error) error {
 	fired := g.stop != nil && !g.stop()
 	if !fired && !g.conn.overdue {
 		if g.deadline && !g.conn.closed.Load() {

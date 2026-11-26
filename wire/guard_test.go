@@ -159,8 +159,10 @@ func TestTimeoutFromElsewhereLeavesTheConnectionAlone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Hour)
 	defer cancel()
 
+	// Nothing was written, so it is marked safe to retry, and otherwise as it
+	// was.
 	err := conn.Watch(ctx).Done(timedOut{})
-	if err != (timedOut{}) {
+	if !errors.Is(err, timedOut{}) || err.Error() != "the source timed out" {
 		t.Fatalf("Done() = %v, want the error as it was", err)
 	}
 	if conn.IsClosed() {

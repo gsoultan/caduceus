@@ -44,7 +44,8 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		defer cancel()
 	}
 
-	return dial(ctx, config, config.firstProtocol())
+	conn, err := dial(ctx, config, config.firstProtocol())
+	return conn, connectError(config, err)
 }
 
 // dial connects asking for a protocol version, in plaintext once more if

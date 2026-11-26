@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -226,4 +227,10 @@ func isTimeout(err error) bool {
 // leaves a connection usable.
 func IsTimeout(err error) bool {
 	return isTimeout(err)
+}
+
+// Timeout reports whether err is from something that ran out of time: its
+// context's deadline passed, or a read or a write ran into one.
+func Timeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || isTimeout(err)
 }
