@@ -4,6 +4,7 @@ package caduceus
 
 import (
 	"context"
+	"io"
 	"strconv"
 
 	"github.com/gsoultan/caduceus/wire"
@@ -305,4 +306,20 @@ func (t *Tx) SendPipeline(ctx context.Context, queries []Query) (*PipelineResult
 		return nil, err
 	}
 	return t.conn.SendPipeline(ctx, queries)
+}
+
+// CopyTo runs a COPY ... TO STDOUT inside the transaction, into w.
+func (t *Tx) CopyTo(ctx context.Context, w io.Writer, sql string) (CommandTag, error) {
+	if err := t.usable(); err != nil {
+		return "", err
+	}
+	return t.conn.CopyTo(ctx, w, sql)
+}
+
+// CopyFromReader runs a COPY ... FROM STDIN inside the transaction, from r.
+func (t *Tx) CopyFromReader(ctx context.Context, r io.Reader, sql string) (CommandTag, error) {
+	if err := t.usable(); err != nil {
+		return "", err
+	}
+	return t.conn.CopyFromReader(ctx, r, sql)
 }
