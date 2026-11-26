@@ -44,16 +44,30 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		defer cancel()
 	}
 
-	conn, err := dial(ctx, config, config.firstProtocol())
-	if !refusedProtocol(err) || config.minProtocol() > Protocol30 {
+	asked := config.firstProtocol()
+	conn, err := dial(ctx, config, asked)
+	if !refusedProtocol(err) {
 		return conn, err
 	}
-	// The server, or a pooler in front of it, knows only 3.0 and said so by
-	// refusing the startup packet. Nothing was authenticated, so asking
-	// again costs a dial and nothing else, and later connections ask for
-	// 3.0 at once.
-	config.downgrade()
-	return dial(ctx, config, Protocol30)
+	if config.minProtocol() > Protocol30 {
+		return nil, fmt.Errorf("%w: the server refused protocol %s, and min_protocol_version is %s: %w",
+			ErrProtocolVersion, asked, config.minProtocol(), err)
+	}
+	return retry30(ctx, config)
+}
+
+// retry30 asks again for 3.0 after a server, or a pooler in front of it,
+// refused the startup packet asking for more. Nothing was authenticated, so
+// asking again costs a dial and nothing else. Only a success shows that the
+// refusal was of the version, not of the database or of a pooler shutting
+// down, which answer with the same codes; only then do later connections ask
+// for 3.0 at once.
+func retry30(ctx context.Context, config *Config) (*Conn, error) {
+	conn, err := dial(ctx, config, Protocol30)
+	if err == nil {
+		config.downgrade()
+	}
+	return conn, err
 }
 
 // dial connects asking for a protocol version, in plaintext once more if

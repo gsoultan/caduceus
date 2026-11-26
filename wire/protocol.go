@@ -5,6 +5,7 @@ package wire
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // ProtocolVersion is a version of PostgreSQL's frontend/backend protocol, the
@@ -23,6 +24,13 @@ const (
 
 // maxCancelKey is the longest cancel key protocol 3.2 allows.
 const maxCancelKey = 256
+
+// protocolRetryInterval is how long a Config that fell back to 3.0 keeps
+// asking for 3.0 at once before it asks for 3.2 again: long enough that a
+// pooler which knows only 3.0 costs a second dial rarely, short enough that
+// an upgraded pooler, a failover or a newer server is found without a
+// restart.
+const protocolRetryInterval = 10 * time.Minute
 
 func (v ProtocolVersion) String() string {
 	return strconv.Itoa(int(v>>16)) + "." + strconv.Itoa(int(v&0xffff))

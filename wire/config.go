@@ -65,16 +65,22 @@ type Config struct {
 	// Zero means Protocol30 and Protocol32: the connection asks for 3.2,
 	// which PostgreSQL 18 and later use, and an older server answers that it
 	// speaks 3.0, which the connection then uses. A pooler that refuses 3.2
-	// outright, as PgBouncer before 1.24 does, is asked again for 3.0, and
-	// every later connection made from this Config, or a copy of it, asks
-	// for 3.0 at once. A MinProtocolVersion of Protocol32 refuses any server
-	// that does not speak 3.2.
+	// outright, as PgBouncer before 1.24 does, is asked again for 3.0. Once
+	// that second attempt succeeds, the connections made from a Config that
+	// ParseConfig returned, or from a copy of one, ask for 3.0 at once for
+	// protocolRetryInterval, then try 3.2 again, so an upgraded pooler or a
+	// newer server is found without a restart. A Config built by hand does
+	// not remember the fallback, and every connection from it pays the
+	// refused dial; build it with ParseConfig, or set MaxProtocolVersion to
+	// Protocol30 behind such a pooler. A MinProtocolVersion of Protocol32
+	// refuses any server that does not speak 3.2.
 	MinProtocolVersion ProtocolVersion
 	MaxProtocolVersion ProtocolVersion
 
-	// downgraded is shared by a Config and its copies: set once a server
-	// refused 3.2, so the connections after it do not ask again.
-	downgraded *atomic.Bool
+	// downgraded is shared by a Config and its copies: the time, in Unix
+	// nanoseconds, a server last refused 3.2 and took 3.0, so the
+	// connections soon after it do not ask again. Zero means never.
+	downgraded *atomic.Int64
 }
 
 // Copy returns a deep copy, safe to adjust for one connection without
@@ -97,9 +103,9 @@ func (c *Config) minProtocol() ProtocolVersion {
 }
 
 // firstProtocol is the version a connection asks for first: the newest
-// allowed, unless a server already refused it.
+// allowed, unless a server refused it within protocolRetryInterval.
 func (c *Config) firstProtocol() ProtocolVersion {
-	if c.downgraded != nil && c.downgraded.Load() && c.minProtocol() == Protocol30 {
+	if c.recentlyDowngraded() && c.minProtocol() == Protocol30 {
 		return Protocol30
 	}
 	if c.MaxProtocolVersion == 0 {
@@ -108,10 +114,21 @@ func (c *Config) firstProtocol() ProtocolVersion {
 	return c.MaxProtocolVersion
 }
 
-// downgrade records that a server refused a newer protocol than 3.0.
+// recentlyDowngraded reports whether a server refused a newer protocol than
+// 3.0 within protocolRetryInterval.
+func (c *Config) recentlyDowngraded() bool {
+	if c.downgraded == nil {
+		return false
+	}
+	at := c.downgraded.Load()
+	return at != 0 && time.Since(time.Unix(0, at)) < protocolRetryInterval
+}
+
+// downgrade records that a server refused a newer protocol than 3.0 and
+// took 3.0.
 func (c *Config) downgrade() {
 	if c.downgraded != nil {
-		c.downgraded.Store(true)
+		c.downgraded.Store(time.Now().UnixNano())
 	}
 }
 

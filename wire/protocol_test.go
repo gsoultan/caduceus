@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // startupServer is a server that answers each connection's startup packet
@@ -197,6 +199,54 @@ func TestConnectDoesNotAskAgainForAnotherRefusal(t *testing.T) {
 	}
 }
 
+// A pooler answers 08P01 for more than the version: a database it does not
+// know, or its own shutdown. This used to make the Config ask for 3.0 for
+// the rest of the process after one such error, though the pooler spoke 3.2.
+// The fallback is now remembered only when asking for 3.0 succeeds.
+func TestConnectRemembersOnlyAFallbackThatWorked(t *testing.T) {
+	server := newStartupServer(t, func(ProtocolVersion, int) []byte { return refusal("08P01") })
+	config := server.config(t, "")
+	if _, err := Connect(t.Context(), config.Copy()); err == nil {
+		t.Fatal("Connect succeeded")
+	}
+	if got := config.firstProtocol(); got != Protocol32 {
+		t.Fatalf("after a refusal of both versions, asks first for %s, want 3.2", got)
+	}
+}
+
+// A fallback used to last for the life of the Config, so a pooler upgraded
+// to speak 3.2, or a failover to PostgreSQL 18, was never asked for 3.2
+// until the process restarted. It now lapses after protocolRetryInterval.
+func TestConnectAsksFor32AgainOnceTheFallbackLapses(t *testing.T) {
+	var speaks32 atomic.Bool
+	server := newStartupServer(t, func(asked ProtocolVersion, _ int) []byte {
+		if asked != Protocol30 && !speaks32.Load() {
+			return refusal("08P01")
+		}
+		return loggedIn(4)
+	})
+	config := server.config(t, "")
+	conn, err := Connect(t.Context(), config.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close(t.Context())
+	if got := config.firstProtocol(); got != Protocol30 {
+		t.Fatalf("after a fallback, asks first for %s, want 3.0", got)
+	}
+	server.versionsAsked()
+	speaks32.Store(true)
+	config.downgraded.Store(time.Now().Add(-protocolRetryInterval).UnixNano())
+	conn, err = Connect(t.Context(), config.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close(t.Context())
+	if got := server.versionsAsked(); !equalVersions(got, []ProtocolVersion{Protocol32}) {
+		t.Fatalf("after the fallback lapsed, asked for %v, want 3.2", got)
+	}
+}
+
 // min_protocol_version and max_protocol_version bound what is asked for and
 // what is accepted.
 func TestConnectHonoursTheProtocolBounds(t *testing.T) {
@@ -225,12 +275,18 @@ func TestConnectHonoursTheProtocolBounds(t *testing.T) {
 			t.Fatalf("Connect = %v, want ErrProtocolVersion", err)
 		}
 	})
+	// This used to return the pooler's bare 08P01, so a caller testing for
+	// ErrProtocolVersion missed a pooler that refused 3.2 outright, though
+	// it caught a server that offered 3.0.
 	t.Run("min 3.2 does not ask again", func(t *testing.T) {
 		server := newStartupServer(t, refusing)
 		_, err := Connect(t.Context(), server.config(t, "&min_protocol_version=latest"))
+		if !errors.Is(err, ErrProtocolVersion) {
+			t.Fatalf("Connect = %v, want ErrProtocolVersion", err)
+		}
 		var failure *Error
 		if !errors.As(err, &failure) || failure.Code != "08P01" {
-			t.Fatalf("Connect = %v, want the pooler's 08P01", err)
+			t.Fatalf("Connect = %v, want the pooler's 08P01 within", err)
 		}
 		if got := server.versionsAsked(); len(got) != 1 {
 			t.Fatalf("asked %d times, want once", len(got))

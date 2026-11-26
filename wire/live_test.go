@@ -195,3 +195,51 @@ func TestLiveProtocolVersion(t *testing.T) {
 		})
 	}
 }
+
+// A pooler that refuses 3.2 outright, as PgBouncer before 1.24 does, is a
+// refusal of the version under min_protocol_version=3.2, which used to reach
+// the caller as the pooler's bare 08P01 rather than ErrProtocolVersion. With
+// no minimum, the second dial asking for 3.0 is what records the fallback,
+// which the earlier live test could not tell from a server offering 3.0.
+func TestLivePoolerRefusing32(t *testing.T) {
+	dsn := os.Getenv("POOLER_URL")
+	if dsn == "" {
+		t.Skip("POOLER_URL not set")
+	}
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	strict, err := ParseConfig(dsn + separator + "min_protocol_version=3.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Connect(t.Context(), strict)
+	if err == nil {
+		_ = conn.Close(t.Context())
+		t.Skip("the pooler speaks 3.2")
+	}
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code != "08P01" {
+		t.Skipf("the pooler did not refuse the startup packet: %v", err)
+	}
+	if !errors.Is(err, ErrProtocolVersion) {
+		t.Fatalf("Connect = %v, want ErrProtocolVersion", err)
+	}
+
+	config, err := ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err = Connect(t.Context(), config.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(t.Context())
+	if conn.ProtocolVersion() != Protocol30 {
+		t.Fatalf("speaks %s, want 3.0", conn.ProtocolVersion())
+	}
+	if got := config.firstProtocol(); got != Protocol30 {
+		t.Fatalf("after asking again for 3.0, the Config asks first for %s, want 3.0", got)
+	}
+}
