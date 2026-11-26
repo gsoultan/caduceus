@@ -12,7 +12,6 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -255,7 +254,6 @@ func (c *Config) protocol(settings map[string]string) error {
 	if c.minProtocol() > c.firstProtocol() {
 		return fmt.Errorf("%w: min_protocol_version is newer than max_protocol_version", ErrInvalidConnString)
 	}
-	c.downgraded = new(atomic.Int64)
 	return nil
 }
 

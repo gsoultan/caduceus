@@ -44,30 +44,7 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		defer cancel()
 	}
 
-	asked := config.firstProtocol()
-	conn, err := dial(ctx, config, asked)
-	if !refusedProtocol(err) {
-		return conn, err
-	}
-	if config.minProtocol() > Protocol30 {
-		return nil, fmt.Errorf("%w: the server refused protocol %s, and min_protocol_version is %s: %w",
-			ErrProtocolVersion, asked, config.minProtocol(), err)
-	}
-	return retry30(ctx, config)
-}
-
-// retry30 asks again for 3.0 after a server, or a pooler in front of it,
-// refused the startup packet asking for more. Nothing was authenticated, so
-// asking again costs a dial and nothing else. Only a success shows that the
-// refusal was of the version, not of the database or of a pooler shutting
-// down, which answer with the same codes; only then do later connections ask
-// for 3.0 at once.
-func retry30(ctx context.Context, config *Config) (*Conn, error) {
-	conn, err := dial(ctx, config, Protocol30)
-	if err == nil {
-		config.downgrade()
-	}
-	return conn, err
+	return dial(ctx, config, config.firstProtocol())
 }
 
 // dial connects asking for a protocol version, in plaintext once more if
@@ -180,11 +157,14 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 
 // startupError is the server's error answering the startup packet. As the
 // first message, before any authentication, an error of protocol 08P01 or
-// 0A000 to a packet asking for more than 3.0 is a refusal of the version,
-// which asking for 3.0 cures.
+// 0A000 to a packet asking for more than 3.0 is most likely a refusal of the
+// version, by something in front of the server that knows only 3.0: that is
+// said, with ErrProtocolVersion, and with what to set. The connection does
+// not ask again. A current PostgreSQL offers 3.0 rather than refusing.
 func startupError(asked ProtocolVersion, at int, failure *Error) error {
 	if at == 0 && refusesProtocol(asked, failure) {
-		return &protocolRefusal{err: failure}
+		return fmt.Errorf("%w: the server refused protocol %s at startup; one that speaks only 3.0 needs max_protocol_version=3.0: %w",
+			ErrProtocolVersion, asked, failure)
 	}
 	return failure
 }
