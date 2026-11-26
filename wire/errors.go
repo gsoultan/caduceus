@@ -14,6 +14,10 @@ var (
 	// disagree about where a message starts, nothing after it can be trusted.
 	ErrProtocol = errors.New("caduceus/wire: protocol violation")
 
+	// ErrProtocolVersion is returned by Connect when the server speaks no
+	// protocol version that min_protocol_version allows.
+	ErrProtocolVersion = errors.New("caduceus/wire: the server speaks no protocol version allowed")
+
 	// ErrMessageTooLarge is returned when the server announces a message larger
 	// than Config.MaxMessageSize. The limit exists so that whoever answers on
 	// the server's address cannot make the client allocate without bound.

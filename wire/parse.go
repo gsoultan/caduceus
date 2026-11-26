@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,6 +46,7 @@ var connectionKeys = map[string]bool{
 	"sslmode": true, "sslrootcert": true, "sslcert": true, "sslkey": true,
 	"sslsni": true, "sslpassword": true, "connect_timeout": true, "passfile": true,
 	"target_session_attrs": true, "hostaddr": true,
+	"min_protocol_version": true, "max_protocol_version": true,
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -64,6 +66,8 @@ var environment = [][2]string{
 	{"PGSSLKEY", "sslkey"}, {"PGAPPNAME", "application_name"},
 	{"PGCONNECT_TIMEOUT", "connect_timeout"}, {"PGPASSFILE", "passfile"},
 	{"PGTARGETSESSIONATTRS", "target_session_attrs"},
+	{"PGMINPROTOCOLVERSION", "min_protocol_version"},
+	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
 }
 
 func parseSettings(text string) (map[string]string, error) {
@@ -171,6 +175,9 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	if err := config.timeout(settings["connect_timeout"]); err != nil {
 		return nil, err
 	}
+	if err := config.protocol(settings); err != nil {
+		return nil, err
+	}
 	if attrs := settings["target_session_attrs"]; attrs != "" && attrs != "any" {
 		return nil, fmt.Errorf("%w: target_session_attrs=%s is not supported", ErrInvalidConnString, attrs)
 	}
@@ -233,6 +240,22 @@ func (c *Config) identity(settings map[string]string) error {
 	if _, given := settings["password"]; !given {
 		c.Password = passwordFromFile(settings["passfile"], c)
 	}
+	return nil
+}
+
+// protocol reads the bounds on the protocol version.
+func (c *Config) protocol(settings map[string]string) error {
+	var err error
+	if c.MinProtocolVersion, err = parseProtocolVersion("min_protocol_version", settings["min_protocol_version"]); err != nil {
+		return err
+	}
+	if c.MaxProtocolVersion, err = parseProtocolVersion("max_protocol_version", settings["max_protocol_version"]); err != nil {
+		return err
+	}
+	if c.minProtocol() > c.firstProtocol() {
+		return fmt.Errorf("%w: min_protocol_version is newer than max_protocol_version", ErrInvalidConnString)
+	}
+	c.downgraded = new(atomic.Bool)
 	return nil
 }
 

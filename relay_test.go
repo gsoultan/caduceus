@@ -147,14 +147,13 @@ func watchedConn(t *testing.T, options Options) (*Conn, func() []sentMessage) {
 // none of which has a type byte.
 func afterStartup(t *testing.T, sent []byte) []byte {
 	t.Helper()
-	const protocol3 = 3 << 16
 	for len(sent) >= 8 {
 		length, code := int(binary.BigEndian.Uint32(sent)), binary.BigEndian.Uint32(sent[4:])
 		if length > len(sent) {
 			break
 		}
 		sent = sent[length:]
-		if code == protocol3 {
+		if code>>16 == 3 {
 			return sent
 		}
 	}

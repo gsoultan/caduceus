@@ -60,8 +60,11 @@ type Conn struct {
 	// query allocates nothing once the connection has warmed up.
 	wbuf []byte
 
-	pid      uint32
-	secret   []byte
+	pid    uint32
+	secret []byte
+	// protocol is the protocol version the connection speaks: what it asked
+	// for, or the older one the server offered instead.
+	protocol ProtocolVersion
 	params   map[string]string
 	txStatus byte
 
@@ -81,6 +84,11 @@ type Conn struct {
 
 // PID returns the server process serving this connection.
 func (c *Conn) PID() uint32 { return c.pid }
+
+// ProtocolVersion returns the protocol version the connection speaks: 3.2
+// with PostgreSQL 18 and later, 3.0 with an older server or a pooler that
+// knows only 3.0.
+func (c *Conn) ProtocolVersion() ProtocolVersion { return c.protocol }
 
 // TxStatus returns the transaction status from the last ReadyForQuery: TxIdle,
 // TxActive or TxFailed.

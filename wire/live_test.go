@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,5 +153,45 @@ func TestLiveReadBufferGrowsForAStreamAndShrinksBack(t *testing.T) {
 	}
 	if len(conn.rbuf) != initialReadBuffer {
 		t.Fatalf("buffer on an idle connection = %d, want %d", len(conn.rbuf), initialReadBuffer)
+	}
+}
+
+// The connection speaks 3.2 with PostgreSQL 18 and later and 3.0 with an
+// older server, which it learns from the server's answer, and a pooler that
+// refuses 3.2 is asked again for 3.0. A query and a cancellation work in
+// whichever it speaks.
+func TestLiveProtocolVersion(t *testing.T) {
+	for _, target := range []string{"DATABASE_URL", "POOLER_URL"} {
+		t.Run(target, func(t *testing.T) {
+			dsn := os.Getenv(target)
+			if dsn == "" {
+				t.Skip(target + " not set")
+			}
+			config, err := ParseConfig(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for round := range 2 {
+				conn, err := Connect(t.Context(), config.Copy())
+				if err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+				major, _, _ := strings.Cut(conn.ParameterStatus("server_version"), ".")
+				version, err := strconv.Atoi(major)
+				if err != nil {
+					t.Fatalf("server_version %q", conn.ParameterStatus("server_version"))
+				}
+				if got := conn.ProtocolVersion(); version < 18 && got != Protocol30 {
+					t.Errorf("round %d: PostgreSQL %d speaks %s, want 3.0", round, version, got)
+				}
+				if got := conn.ProtocolVersion(); version >= 18 && target == "DATABASE_URL" && got != Protocol32 {
+					t.Errorf("round %d: PostgreSQL %d speaks %s, want 3.2", round, version, got)
+				}
+				if _, err := conn.Exec(t.Context(), "SELECT 1"); err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+				_ = conn.Close(t.Context())
+			}
+		})
 	}
 }

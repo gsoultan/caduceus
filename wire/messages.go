@@ -43,7 +43,6 @@ const (
 )
 
 const (
-	protocolVersion30 = 3 << 16
 	sslRequestCode    = 80877103
 	cancelRequestCode = 80877102
 	headerSize        = 5

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sort"
@@ -43,11 +44,26 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		defer cancel()
 	}
 
-	conn, err := connect(ctx, config, config.TLSConfig)
+	conn, err := dial(ctx, config, config.firstProtocol())
+	if !refusedProtocol(err) || config.minProtocol() > Protocol30 {
+		return conn, err
+	}
+	// The server, or a pooler in front of it, knows only 3.0 and said so by
+	// refusing the startup packet. Nothing was authenticated, so asking
+	// again costs a dial and nothing else, and later connections ask for
+	// 3.0 at once.
+	config.downgrade()
+	return dial(ctx, config, Protocol30)
+}
+
+// dial connects asking for a protocol version, in plaintext once more if
+// TLS is preferred but not to be had.
+func dial(ctx context.Context, config *Config, version ProtocolVersion) (*Conn, error) {
+	conn, err := connect(ctx, config, config.TLSConfig, version)
 	if err == nil || config.TLSConfig == nil || !config.TLSFallback || !fallbackWorthy(err) {
 		return conn, err
 	}
-	return connect(ctx, config, nil)
+	return connect(ctx, config, nil, version)
 }
 
 // fallbackWorthy reports whether a failure was TLS's rather than the server's
@@ -64,7 +80,7 @@ func ctxErr(err error) error {
 	return nil
 }
 
-func connect(ctx context.Context, config *Config, tlsConfig *tls.Config) (*Conn, error) {
+func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version ProtocolVersion) (*Conn, error) {
 	network, address := config.target()
 	netConn, err := (&net.Dialer{KeepAlive: 5 * time.Minute}).DialContext(ctx, network, address)
 	if err != nil {
@@ -79,10 +95,11 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config) (*Conn,
 	}
 
 	c := &Conn{
-		netConn: netConn,
-		config:  config,
-		rbuf:    make([]byte, initialReadBuffer),
-		params:  make(map[string]string, 16),
+		netConn:  netConn,
+		config:   config,
+		rbuf:     make([]byte, initialReadBuffer),
+		params:   make(map[string]string, 16),
+		protocol: version,
 	}
 	err = c.login(ctx, tlsConfig)
 	interrupted := !stop()
@@ -115,7 +132,8 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 	}
 
 	auth := authenticator{conn: c}
-	for range maxLoginMessages {
+	asked := c.protocol
+	for i := range maxLoginMessages {
 		kind, body, err := c.Receive()
 		if err != nil {
 			return err
@@ -126,22 +144,67 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 				return err
 			}
 		case MsgBackendKeyData:
-			if len(body) < 8 {
+			if !c.cancelKey(body) {
 				return ErrProtocol
 			}
-			c.pid, c.secret = be32(body), append([]byte(nil), body[4:]...)
 		case MsgErrorResponse:
-			return parseError(body)
+			return startupError(asked, i, parseError(body))
 		case MsgReadyForQuery:
 			return auth.finish()
 		case MsgNegotiateProtocol:
-			// The server speaks an older minor version than asked for; 3.0 is
-			// all this asks for, so there is nothing to negotiate down from.
+			// The server speaks an older minor version than asked for, and
+			// offers the newest it does.
+			if err := c.negotiate(body); err != nil {
+				return err
+			}
 		default:
 			return ErrProtocol
 		}
 	}
 	return ErrProtocol
+}
+
+// startupError is the server's error answering the startup packet. As the
+// first message, before any authentication, an error of protocol 08P01 or
+// 0A000 to a packet asking for more than 3.0 is a refusal of the version,
+// which asking for 3.0 cures.
+func startupError(asked ProtocolVersion, at int, failure *Error) error {
+	if at == 0 && refusesProtocol(asked, failure) {
+		return &protocolRefusal{err: failure}
+	}
+	return failure
+}
+
+// negotiate takes up the version a NegotiateProtocolVersion offers: the
+// newest minor version the server speaks, which must be older than the one
+// asked for and no older than the oldest allowed. The names of options it did
+// not recognise follow, and none are sent.
+func (c *Conn) negotiate(body []byte) error {
+	if len(body) < 8 {
+		return ErrProtocol
+	}
+	offered := ProtocolVersion(3<<16 | be32(body)&0xffff)
+	switch {
+	case offered >= c.protocol:
+		return ErrProtocol
+	case offered < c.config.minProtocol():
+		return fmt.Errorf("%w: the server speaks protocol %s, and min_protocol_version is %s",
+			ErrProtocolVersion, offered, c.config.minProtocol())
+	}
+	c.protocol = offered
+	return nil
+}
+
+// cancelKey takes up the process ID and cancel key of a BackendKeyData, and
+// reports whether they are well formed: a key of 4 bytes in protocol 3.0, of
+// 4 to 256 in 3.2.
+func (c *Conn) cancelKey(body []byte) bool {
+	key := len(body) - 4
+	if key < 4 || key > maxCancelKey || (c.protocol == Protocol30 && key != 4) {
+		return false
+	}
+	c.pid, c.secret = be32(body), append([]byte(nil), body[4:]...)
+	return true
 }
 
 // negotiateTLS asks for encryption before anything else is sent, so that no
@@ -172,7 +235,7 @@ func (c *Conn) negotiateTLS(ctx context.Context, config *tls.Config) error {
 }
 
 func (c *Conn) startupMessage() []byte {
-	body := binary.BigEndian.AppendUint32(make([]byte, 4, 256), protocolVersion30)
+	body := binary.BigEndian.AppendUint32(make([]byte, 4, 256), uint32(c.protocol))
 	body = AppendString(AppendString(body, "user"), c.config.User)
 	body = AppendString(AppendString(body, "database"), c.config.Database)
 

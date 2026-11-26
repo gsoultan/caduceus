@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +59,22 @@ type Config struct {
 	// version, such as gVisor or WSL 1, is taken at its word: set this there
 	// if long results stall at their end.
 	NoStreamWatermark bool
+
+	// MinProtocolVersion and MaxProtocolVersion bound the protocol version a
+	// connection uses, as min_protocol_version and max_protocol_version do.
+	// Zero means Protocol30 and Protocol32: the connection asks for 3.2,
+	// which PostgreSQL 18 and later use, and an older server answers that it
+	// speaks 3.0, which the connection then uses. A pooler that refuses 3.2
+	// outright, as PgBouncer before 1.24 does, is asked again for 3.0, and
+	// every later connection made from this Config, or a copy of it, asks
+	// for 3.0 at once. A MinProtocolVersion of Protocol32 refuses any server
+	// that does not speak 3.2.
+	MinProtocolVersion ProtocolVersion
+	MaxProtocolVersion ProtocolVersion
+
+	// downgraded is shared by a Config and its copies: set once a server
+	// refused 3.2, so the connections after it do not ask again.
+	downgraded *atomic.Bool
 }
 
 // Copy returns a deep copy, safe to adjust for one connection without
@@ -69,6 +86,33 @@ func (c *Config) Copy() *Config {
 		clone.TLSConfig = c.TLSConfig.Clone()
 	}
 	return &clone
+}
+
+// minProtocol is the oldest protocol version a connection may use.
+func (c *Config) minProtocol() ProtocolVersion {
+	if c.MinProtocolVersion == 0 {
+		return Protocol30
+	}
+	return c.MinProtocolVersion
+}
+
+// firstProtocol is the version a connection asks for first: the newest
+// allowed, unless a server already refused it.
+func (c *Config) firstProtocol() ProtocolVersion {
+	if c.downgraded != nil && c.downgraded.Load() && c.minProtocol() == Protocol30 {
+		return Protocol30
+	}
+	if c.MaxProtocolVersion == 0 {
+		return Protocol32
+	}
+	return c.MaxProtocolVersion
+}
+
+// downgrade records that a server refused a newer protocol than 3.0.
+func (c *Config) downgrade() {
+	if c.downgraded != nil {
+		c.downgraded.Store(true)
+	}
 }
 
 // unix reports whether Host names a socket directory.
