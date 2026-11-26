@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
+	"net"
 	"reflect"
 	"strconv"
 	"time"
@@ -81,8 +83,30 @@ func Encode(dst []byte, oid uint32, arg any) ([]byte, int16, bool, error) {
 			return dst, 0, true, nil
 		}
 		return append(dst, v...), 0, false, nil
+	case columnEncoder:
+		if isNilPointer(arg) {
+			return dst, 0, true, nil
+		}
+		dst, null, err := v.encodeColumn(dst, oid)
+		return dst, 0, null, err
 	case Valuer:
 		return encodeValuer(dst, oid, v)
+	case net.HardwareAddr:
+		if v == nil {
+			return dst, 0, true, nil
+		}
+		return encodeText(dst, v.String())
+	case *net.IPNet:
+		if v == nil {
+			return dst, 0, true, nil
+		}
+		return encodeText(dst, v.String())
+	case *big.Rat:
+		if v == nil {
+			return dst, 0, true, nil
+		}
+		dst, err := exactDecimal(dst, v)
+		return dst, 0, false, err
 	case encoding.TextMarshaler:
 		if isNilPointer(arg) {
 			return dst, 0, true, nil

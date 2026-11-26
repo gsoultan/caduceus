@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"reflect"
 	"strconv"
 	"time"
@@ -90,6 +91,13 @@ func Scan(oid uint32, format int16, src []byte, dest any) error {
 		value, err := Natural(oid, format, src)
 		*d = value
 		return err
+	case *net.HardwareAddr:
+		return scanHardwareAddr(oid, format, src, d)
+	case *net.IPNet:
+		if src == nil {
+			return nullInto(dest)
+		}
+		return scanIPNet(oid, format, src, d)
 	case *json.RawMessage:
 		if src == nil {
 			*d = nil
@@ -98,6 +106,8 @@ func Scan(oid uint32, format int16, src []byte, dest any) error {
 		b, err := asBytes(oid, format, src)
 		*d = b
 		return err
+	case columnScanner:
+		return d.scanColumn(oid, format, src)
 	case Scanner:
 		value, err := scannerValue(oid, format, src)
 		if err != nil {

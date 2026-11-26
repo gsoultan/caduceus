@@ -355,11 +355,23 @@ func parseTimestampText(oid uint32, src string) (time.Time, error) {
 		}
 	default:
 		t, err = time.Parse("2006-01-02 15:04:05.999999999", src)
+		if err != nil && oid != Timestamp {
+			t, err = untypedTime(src)
+		}
 	}
 	if err == nil && bc {
 		t = t.AddDate(1-2*t.Year(), 0, 0)
 	}
 	return t, err
+}
+
+// untypedTime reads the text of a time whose type is not known, as a field
+// of a record is: a timestamptz's, with its zone, or a date's.
+func untypedTime(src string) (time.Time, error) {
+	if t, err := parseWithZone(src); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02", src)
 }
 
 func parseWithZone(src string) (time.Time, error) {

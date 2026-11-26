@@ -16,6 +16,10 @@ var (
 	// ErrOverflow is returned when a value does not fit the variable.
 	ErrOverflow = errors.New("caduceus/codec: value out of range for destination")
 
+	// ErrInexact is returned when a *big.Rat has no finite decimal, such as
+	// 1/3, and so no exact numeric to send.
+	ErrInexact = errors.New("caduceus/codec: fraction has no exact decimal")
+
 	errInfinite = errors.New("caduceus/codec: infinite date or timestamp cannot be a time.Time")
 	errMonths   = errors.New("caduceus/codec: an interval with months cannot be a time.Duration")
 )

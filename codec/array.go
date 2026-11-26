@@ -99,24 +99,41 @@ func nest(values []any, dims []int) any {
 
 // scanArray decodes a binary array into a slice, or nested slices for more
 // than one dimension.
+//
+// An array in text, as one of a type with no binary form here arrives, an
+// enum's, numeric's or inet's, is read from its literal, and each element
+// scanned from its text, as its element type if that is known here and as a
+// value of unknown type is otherwise: an int, a float, a string or anything
+// with an UnmarshalText.
 func scanArray(oid uint32, format int16, src []byte, value reflect.Value) error {
 	element, known := arrayElements[oid]
-	if !known || format != 1 {
-		return errFormat(oid, value.Type().String())
-	}
-	array, err := parseArray(src)
+	array, err := readArray(oid, known, format, src, value)
 	if err != nil {
 		return err
+	}
+	if !known {
+		element = Unknown
 	}
 	if len(array.dims) == 0 {
 		value.Set(reflect.MakeSlice(value.Type(), 0, 0))
 		return nil
 	}
-	_, err = fillSlice(value, element, array.dims, array.elements)
+	_, err = fillSlice(value, element, format, array.dims, array.elements)
 	return err
 }
 
-func fillSlice(value reflect.Value, element uint32, dims []int, elements [][]byte) ([][]byte, error) {
+// readArray reads a binary array of a known type, or an array literal.
+func readArray(oid uint32, known bool, format int16, src []byte, value reflect.Value) (binaryArray, error) {
+	switch {
+	case format == 1 && known:
+		return parseArray(src)
+	case format == 0 && len(src) > 0 && (src[0] == '{' || src[0] == '['):
+		return parseTextArray(src)
+	}
+	return binaryArray{}, errFormat(oid, value.Type().String())
+}
+
+func fillSlice(value reflect.Value, element uint32, format int16, dims []int, elements [][]byte) ([][]byte, error) {
 	if value.Kind() != reflect.Slice {
 		return nil, fmt.Errorf("caduceus/codec: array has more dimensions than %s", value.Type())
 	}
@@ -125,12 +142,12 @@ func fillSlice(value reflect.Value, element uint32, dims []int, elements [][]byt
 		target := slice.Index(i)
 		if len(dims) > 1 {
 			var err error
-			if elements, err = fillSlice(target, element, dims[1:], elements); err != nil {
+			if elements, err = fillSlice(target, element, format, dims[1:], elements); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		if err := Scan(element, elementFormat, elements[0], target.Addr().Interface()); err != nil {
+		if err := Scan(element, format, elements[0], target.Addr().Interface()); err != nil {
 			return nil, err
 		}
 		elements = elements[1:]
