@@ -25,5 +25,3 @@ func QuoteLiteral(s string) string {
 	}
 	return quoted
 }
-
-func quoteIdentifier(s string) string { return QuoteIdentifier(s) }

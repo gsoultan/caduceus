@@ -5,7 +5,6 @@ package caduceus
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 
 	"github.com/gsoultan/caduceus/wire"
@@ -45,7 +44,7 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 	table := quoteQualifiedName(request.Table)
 	columns := make([]string, len(request.Columns))
 	for i, column := range request.Columns {
-		columns[i] = quoteIdentifier(column)
+		columns[i] = QuoteIdentifier(column)
 	}
 	list := strings.Join(columns, ", ")
 
@@ -140,12 +139,6 @@ func sendRows(stream *copyStream, rows CopySource) error {
 	return rows.Err()
 }
 
-// copyCount reads the row count from a "COPY n" tag.
-func copyCount(tag string) int64 {
-	n, _ := strconv.ParseInt(strings.TrimPrefix(tag, "COPY "), 10, 64)
-	return n
-}
-
 func isServerError(err error) bool {
 	var failure *wire.Error
 	return errors.As(err, &failure)
@@ -155,7 +148,7 @@ func isServerError(err error) bool {
 func quoteQualifiedName(parts []string) string {
 	quoted := make([]string, len(parts))
 	for i, part := range parts {
-		quoted[i] = quoteIdentifier(part)
+		quoted[i] = QuoteIdentifier(part)
 	}
 	return strings.Join(quoted, ".")
 }

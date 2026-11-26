@@ -174,7 +174,7 @@ func (c *copyStream) result() (int64, error) {
 		if failure == nil {
 			failure = err
 		}
-		total += copyCount(tag)
+		total += CommandTag(tag).RowsAffected()
 	}
 	if failure != nil {
 		return 0, failure
