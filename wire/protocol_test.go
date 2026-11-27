@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
 	"testing"
 )
 
@@ -154,11 +153,16 @@ func TestConnectSpeaksWhatAnOlderServerOffers(t *testing.T) {
 }
 
 // A pooler that knows only 3.0 refuses a startup packet asking for 3.2, as
-// PgBouncer 1.22 does with "bad packet header", and a server older than the
-// NegotiateProtocolVersion message with 0A000. The connection is not asked
-// again for 3.0, and the error says so and what to set, rather than being
-// the pooler's bare "bad packet header".
-func TestConnectReportsARefusalOf32(t *testing.T) {
+// PgBouncer before 1.24 does with "bad packet header", and a server older than
+// the NegotiateProtocolVersion message with 0A000. The connection asks once
+// more, for 3.0, and speaks that.
+//
+// It used to fail with ErrProtocolVersion and leave the retry to the caller,
+// who had to know to set max_protocol_version=3.0. Behind such a pooler every
+// connection a pool opened failed, so an application sharing one database
+// among many workers had none at all until someone changed every connection
+// string.
+func TestConnectFallsBackTo30WhenRefused32(t *testing.T) {
 	for _, code := range []string{"08P01", "0A000"} {
 		t.Run(code, func(t *testing.T) {
 			server := newStartupServer(t, func(asked ProtocolVersion, _ int) []byte {
@@ -167,18 +171,50 @@ func TestConnectReportsARefusalOf32(t *testing.T) {
 				}
 				return loggedIn(4)
 			})
-			_, err := Connect(t.Context(), server.config(t, ""))
-			if !errors.Is(err, ErrProtocolVersion) || !strings.Contains(err.Error(), "max_protocol_version=3.0") {
-				t.Fatalf("Connect = %v, want ErrProtocolVersion naming max_protocol_version=3.0", err)
+			conn, err := Connect(t.Context(), server.config(t, ""))
+			if err != nil {
+				t.Fatalf("Connect = %v, want a connection speaking 3.0", err)
 			}
-			var failure *Error
-			if !errors.As(err, &failure) || failure.Code != code {
-				t.Fatalf("Connect = %v, want the server's %s within", err, code)
+			defer conn.Close(t.Context())
+			if conn.ProtocolVersion() != Protocol30 {
+				t.Fatalf("speaks %s, want 3.0", conn.ProtocolVersion())
 			}
-			if got := server.versionsAsked(); !equalVersions(got, []ProtocolVersion{Protocol32}) {
-				t.Fatalf("asked for %v, want 3.2 once", got)
+			if got := server.versionsAsked(); !equalVersions(got, []ProtocolVersion{Protocol32, Protocol30}) {
+				t.Fatalf("asked for %v, want 3.2 and then 3.0", got)
 			}
 		})
+	}
+}
+
+// The second ask is the last. Something that refuses 3.0 as well is not a
+// pooler that knows only 3.0, and its answer to 3.0 is the error: no third
+// dial, and no loop.
+func TestConnectAsksFor30OnlyOnce(t *testing.T) {
+	server := newStartupServer(t, func(ProtocolVersion, int) []byte { return refusal("08P01") })
+	_, err := Connect(t.Context(), server.config(t, ""))
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code != "08P01" {
+		t.Fatalf("Connect = %v, want the server's 08P01", err)
+	}
+	if got := server.versionsAsked(); !equalVersions(got, []ProtocolVersion{Protocol32, Protocol30}) {
+		t.Fatalf("asked for %v, want 3.2 and then 3.0, once each", got)
+	}
+}
+
+// What the second ask is refused with is the error, since it is the reason
+// there is no connection: a pooler that takes 3.0 and then refuses the
+// password says so, not that it refused 3.2.
+func TestConnectReportsWhat30WasRefusedWith(t *testing.T) {
+	server := newStartupServer(t, func(asked ProtocolVersion, _ int) []byte {
+		if asked != Protocol30 {
+			return refusal("08P01")
+		}
+		return refusal("28P01")
+	})
+	_, err := Connect(t.Context(), server.config(t, ""))
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code != "28P01" {
+		t.Fatalf("Connect = %v, want the server's 28P01", err)
 	}
 }
 
