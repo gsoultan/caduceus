@@ -107,6 +107,12 @@ func TestLiveLogicalReplication(t *testing.T) {
 		}
 		kinds = append(kinds, parsed.Type())
 		check(t, parsed, table)
+		// Before PostgreSQL 15, pgoutput sends every other transaction too,
+		// as a Begin and a Commit with nothing between: whatever else ran on
+		// the server meanwhile. It is not the one under test.
+		if string(kinds) == "BC" {
+			kinds = kinds[:0]
+		}
 	}
 	// pgoutput sends the relation again ahead of the truncate.
 	if string(kinds) != "BRIMRTC" {
@@ -208,8 +214,10 @@ func TestLivePhysicalReplicationAndDrop(t *testing.T) {
 	if err := <-dropped; err != nil {
 		t.Fatal(err)
 	}
-	if state, err := ReadReplicationSlot(ctx, dropper, slot); err != nil || state.Exists {
-		t.Fatalf("after DropReplicationSlot: %+v, %v", state, err)
+	if serverMajor(t, dropper) >= 15 {
+		if state, err := ReadReplicationSlot(ctx, dropper, slot); err != nil || state.Exists {
+			t.Fatalf("after DropReplicationSlot: %+v, %v", state, err)
+		}
 	}
 }
 
