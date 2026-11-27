@@ -259,3 +259,32 @@ func TestEncodeRefusesFloatOverflowingReal(t *testing.T) {
 		}
 	}
 }
+
+// A pointer to a basic type encodes as its value, and a nil one as NULL,
+// without going through reflection.
+func TestEncodePointerToABasicType(t *testing.T) {
+	s, n, b, u := "x", int64(7), true, [16]byte{1}
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, c := range []struct {
+		oid uint32
+		arg any
+		ptr any
+	}{
+		{Text, s, &s}, {Int8, n, &n}, {Bool, b, &b}, {UUID, u, &u}, {Timestamptz, ts, &ts},
+	} {
+		want, wf, _, err := Encode(nil, c.oid, c.arg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, gf, null, err := Encode(nil, c.oid, c.ptr)
+		if err != nil || null || gf != wf || string(got) != string(want) {
+			t.Errorf("%T: %x (format %d, null %v, %v), want %x (format %d)", c.ptr, got, gf, null, err, want, wf)
+		}
+	}
+	if _, _, null, err := Encode(nil, Int8, (*int64)(nil)); err != nil || !null {
+		t.Errorf("nil *int64: null = %v, %v; want NULL", null, err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _, _, _, _ = Encode(make([]byte, 0, 16), Int8, &n) }); allocs > 1 {
+		t.Errorf("*int64 costs %v allocations, want at most the buffer's", allocs)
+	}
+}

@@ -84,6 +84,9 @@ func Encode(dst []byte, oid uint32, arg any) ([]byte, int16, bool, error) {
 			return dst, 0, true, nil
 		}
 		return append(dst, v...), 0, false, nil
+	case *string, *int64, *int32, *int16, *int, *float64, *bool, *time.Time, *[16]byte, *[]byte:
+		out, format, null, _, err := encodePointer(dst, oid, arg)
+		return out, format, null, err
 	case BinaryParam:
 		if isNilPointer(arg) {
 			return dst, 1, true, nil
