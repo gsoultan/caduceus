@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_wire_messages_go", "label": "messages.go", "file_type": "code", "source_file": "wire/messages.go", "source_location": "L1"}], "edges": [], "raw_calls": [], "go_imports": {}, "go_type_table": {"path": "$graphify-root$/wire/messages.go", "table": {}, "package_vars": {}, "package_path": "github.com/gsoultan/caduceus/wire"}}
