@@ -22,24 +22,19 @@ func (p int4Param) AppendBinaryParam(dst []byte, oid uint32) ([]byte, bool, erro
 	return binary.BigEndian.AppendUint32(dst, uint32(p)), false, nil
 }
 
-func TestNewStatementAsksBinaryForTheTypesNamed(t *testing.T) {
-	fields := []wire.Field{{Name: "n", DataTypeOID: codec.Numeric}, {Name: "t", DataTypeOID: codec.Text}}
-	plain := newStatement("", "", nil, slicesClone(fields), nil)
-	if plain.requested(0) != wire.TextFormat {
-		t.Fatalf("numeric without BinaryResults asked in %d, want text", plain.requested(0))
+// numericInBinary asks for numeric in binary and everything else as the codec
+// would, as a caller with its own numeric decoder does.
+func numericInBinary(oid uint32) int16 {
+	if oid == codec.Numeric {
+		return wire.BinaryFormat
 	}
-	forced := newStatement("", "", nil, slicesClone(fields), Options{BinaryResults: []uint32{codec.Numeric}}.binaryResults())
-	if forced.requested(0) != wire.BinaryFormat || forced.requested(1) != wire.TextFormat {
-		t.Fatalf("formats = %v, want numeric binary and text text", forced.formats)
-	}
+	return codec.ResultFormat(oid)
 }
-
-func slicesClone(f []wire.Field) []wire.Field { return append([]wire.Field(nil), f...) }
 
 func TestLiveBinaryResultsAndBinaryParam(t *testing.T) {
 	for _, options := range []Options{
-		{BinaryResults: []uint32{codec.Numeric}},
-		{BinaryResults: []uint32{codec.Numeric}, StatementCacheCapacity: -1},
+		{ResultFormat: numericInBinary},
+		{ResultFormat: numericInBinary, StatementCacheCapacity: -1},
 	} {
 		conn := liveConn(t, options)
 		ctx := t.Context()

@@ -1,7 +1,8 @@
 # caduceus
 
 A PostgreSQL driver for Go, written from the protocol up. Pure Go, standard
-library only: no `database/sql`, no pgx, no pglogrepl. `go.mod` requires nothing.
+library only: no pgx, no pglogrepl. `go.mod` requires nothing. `caduceus` itself does
+not use `database/sql`; package `caduceus/stdlib` is its driver for code that does.
 
 ```go
 import "github.com/gsoultan/caduceus"
@@ -20,10 +21,10 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 
 | | |
 | :--- | :--- |
-| **Connect** | URL or key=value strings, `PG*` environment variables, the password file, TLS by `sslmode` (`disable` … `verify-full`), SCRAM-SHA-256, MD5 and cleartext auth, Unix sockets. Several hosts, `host=a,b port=5432,5433` or `postgres://a:5432,b:5433/db`, tried in order, each with its own `ConnectTimeout` and its certificate checked against its own name; a wrong password, a missing database or a missing privilege stops there. `target_session_attrs` = `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`, judged from what PostgreSQL 14 and later report at login, without a round trip. Hooks on `wire.Config`: `DialFunc`, `LookupFunc`, `ValidateConnect`, `AfterConnect`, and `Fallbacks` set directly. `service=` reads the service file (`PGSERVICEFILE`, `~/.pg_service.conf`, then `PGSYSCONFDIR`). `channel_binding` (`disable`, `prefer`, `require`) binds SCRAM to the TLS connection as SCRAM-SHA-256-PLUS. `require_auth` limits the methods the server may ask for, refused before the password is sent. `sslnegotiation=direct` starts TLS at once with ALPN `postgresql` (PostgreSQL 17 and later). `sslpassword` decrypts a client key in OpenSSL's traditional encrypted format |
+| **Connect** | URL or key=value strings, `PG*` environment variables, the password file, TLS by `sslmode` (`disable` … `verify-full`), SCRAM-SHA-256, MD5 and cleartext auth, Unix sockets. Several hosts, `host=a,b port=5432,5433` or `postgres://a:5432,b:5433/db`, tried in order, each with its own `ConnectTimeout` and its certificate checked against its own name; a wrong password, a missing database or a missing privilege stops there. `target_session_attrs` = `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`, judged from what PostgreSQL 14 and later report at login, without a round trip. Hooks on `wire.Config`: `DialFunc`, `LookupFunc`, `ValidateConnect`, `AfterConnect`, and `Fallbacks` set directly. `service=` reads the service file (`PGSERVICEFILE`, `~/.pg_service.conf`, then `PGSYSCONFDIR`). `channel_binding` (`disable`, `prefer`, `require`) binds SCRAM to the TLS connection as SCRAM-SHA-256-PLUS. `require_auth` limits the methods the server may ask for, refused before the password is sent. `sslnegotiation=direct` starts TLS at once with ALPN `postgresql` (PostgreSQL 17 and later). `sslpassword` decrypts a client key in OpenSSL's traditional encrypted format. Kerberos (`gss`, and `sspi` answered the same way) through `wire.Config.NewGSS`, which the separate module `caduceus/gss` fills on gokrb5, so caduceus itself still requires nothing; `krbsrvname` and `krbspn` name the server's principal. GSSAPI encryption (`gssencmode=require`) is refused: use TLS |
 | **Protocol** | 3.2 with PostgreSQL 18 and later, whose cancel key is up to 256 bytes where 3.0's is 4; 3.0 with an older server: PostgreSQL 9.3 to 17 offers 3.0 in a NegotiateProtocolVersion. Something in front of the server that knows only 3.0 and refuses 3.2 outright, such as PgBouncer before 1.24, is dialled once more asking for 3.0, which the connection then speaks; `max_protocol_version=3.0` saves that second dial, and `min_protocol_version=3.2` forbids it, failing with `ErrProtocolVersion` instead. `min_protocol_version` and `max_protocol_version` (`3.0`, `3.2`, `latest`) bound it, as in libpq 18 |
 | **Query** | `Exec`, `Query`, `QueryRow`, `QueryInto`; parameters always bound server-side, never interpolated. `Exec` returns a `CommandTag`, whose `RowsAffected` counts the rows touched. Named arguments: pass `NamedArgs{"id": 42}` as the only argument and write `@id` in the SQL; `StrictNamedArgs` refuses a name that is missing or unused. Any `QueryRewriter` given as the only argument rewrites the statement first |
-| **Results** | `CollectRows`, `AppendRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`; rows into scalars (`RowTo`), maps (`RowToMap`) and structs by name or position (`RowToStructByName`, `…ByNameLax`, `…ByPos`, and `RowToAddrOf…` for pointers); `Rows.Values` decodes a row to Go values |
+| **Results** | `CollectRows`, `AppendRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`; rows into scalars (`RowTo`), maps (`RowToMap`) and structs by name or position (`RowToStructByName`, `…ByNameLax`, `…ByPos`, and `RowToAddrOf…` for pointers); `Rows.Values` decodes a row to Go values. `Options.ResultFormat` chooses the format each column is asked for in, for a caller that decodes `RawValues` itself |
 | **Transactions** | `Begin`, `BeginTx` with isolation level, read-only and deferrable; nested transactions as savepoints; idempotent `Commit` / `Rollback`. `BeginFunc` and `BeginTxFunc` run a function in a transaction, committing on nil and rolling back on an error or a panic |
 | **Batch** | `SendBatch`: any number of queries as one transaction, in at most two round trips when they fit a 32 KiB window and a window at a time beyond that. `Batch.Queue` builds one a statement at a time, each with a callback for its result, and `Batch.Run` sends it, as pgx's `Batch` does |
 | **Pipeline** | `SendPipeline`: any number of statements sent without waiting for each reply, each failing on its own; inside a transaction, the fastest way to run many statements |
@@ -35,8 +36,9 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection; one already over before the query is sent sends nothing and leaves the connection open |
 | **Prepared statements** | `Prepare` and `Tx.Prepare` return a `StatementDescription` (parameter OIDs, result fields); every way of running a statement runs a prepared one given its name, with no Parse; `Deallocate`, `DeallocateAll`. Kept apart from the statement cache, which never evicts them, and on the server whatever the options |
 | **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
-| **Types** | integers, floats, numeric (into `*big.Rat`, `*big.Float`, a float or a string, and from `*big.Rat` as its exact decimal), bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, enums and domains as their text; `inet`/`cidr` into `netip.Addr`, `netip.Prefix`, `net.IP` or `net.IPNet`, `macaddr` into `net.HardwareAddr`; arrays of every type, as slices, nested for more dimensions; `codec.Range[T]` and `codec.Multirange[T]` for the range types and your own; `codec.Hstore`; `codec.Bits` for bit and varbit; `codec.Point`, `Box`, `Lseg`, `Line`, `Circle`, `Path`, `Polygon`; `codec.CompositeFields` for a record or a composite type's row, in and out; `codec.Scanner` and `codec.Valuer` for your own types, and `codec.BinaryParam` for one that writes its own binary form; `Options.BinaryResults` asks for named types in binary, for a caller that decodes `Rows.RawValues` itself; a pointer destination receives NULL |
+| **Types** | integers, floats, numeric (into `*big.Rat`, `*big.Float`, a float or a string, and from `*big.Rat` as its exact decimal), bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, enums and domains as their text; `inet`/`cidr` into `netip.Addr`, `netip.Prefix`, `net.IP` or `net.IPNet`, `macaddr` into `net.HardwareAddr`; arrays of every type, as slices, nested for more dimensions; `codec.Range[T]` and `codec.Multirange[T]` for the range types and your own; `codec.Hstore`; `codec.Bits` for bit and varbit; `codec.Point`, `Box`, `Lseg`, `Line`, `Circle`, `Path`, `Polygon`; `codec.CompositeFields` for a record or a composite type's row, in and out; `codec.Scanner` and `codec.Valuer` for your own types, and `codec.BinaryParam` for one that writes its own binary form; a pointer destination receives NULL |
 | **Errors** | `*wire.Error` with the SQLSTATE and every field the server sends; classify by `SQLState()`, never by message text. `wire.SafeToRetry(err)` holds for what never reached the server: nothing of it was written, as for a busy or closed connection, a context already over, or arguments that do not fit, so running it again cannot run it twice. `wire.Timeout(err)` holds for a deadline, the context's or the socket's. A failed connect is a `*wire.ConnectError` naming host, port, user and database, never the password; a connection string that does not parse is `ErrInvalidConnString`, which never quotes it |
+| **database/sql** | package `stdlib` registers the driver `caduceus`: `sql.Open("caduceus", dsn)`, or `stdlib.OpenDB(config, options)` from a `wire.Config`. Arguments are bound as caduceus binds them, so a slice is an array and a `driver.Valuer` is called, nil pointer as NULL; `$1` placeholders, or a `caduceus.NamedArgs` as the only argument for `@name`, and `sql.Named` refused. Columns come back as `int64`, `float64`, `bool`, `[]byte`, `time.Time`, and otherwise PostgreSQL's text as a `string` (numeric, uuid, interval, json, arrays). `BeginTx` maps the isolation levels PostgreSQL has and refuses the rest; `DB.Prepare` prepares on the server and `Stmt.Close` deallocates there. A connection the server ended while idle is found by `CheckConn` before it is handed out, so the caller gets a fresh one rather than the error. `sql.Conn.Raw` gives the `*caduceus.Conn` underneath, for COPY and batches |
 | **Logical replication** | package `replication`: `ParseMessage` for every pgoutput message of protocol 1 to 4 (streamed, two-phase, origin, logical messages), XLogData, keepalives, `SendStandbyStatusUpdate`, LSNs, and the walsender commands `IdentifySystem`, `CreateReplicationSlot`, `DropReplicationSlot`, `ReadReplicationSlot`, `TimelineHistoryFile` and `StartReplication`, with `PgoutputOptions` for the plugin arguments. Slot names are checked against `ValidSlotName`, literals go through the replication grammar's `QuoteLiteral`. Physical `BASE_BACKUP` is not provided. |
 
 ### Transactions
@@ -238,6 +240,14 @@ else. A value only the server can read, such as the string `"42"` for an integer
 column, is not refused: from that row on the rows go in text, as a second COPY
 that commits or fails together with the first.
 
+A copy of more than 64 KiB reads the server's replies on a goroutine of its own
+while it writes, for `CopyFrom` and `CopyFromReader` alike. A server that
+answers rows with notices, from a trigger that raises one per row, writes as
+much as it reads, and a client that only wrote would leave both waiting on
+each other until the deadline. Notices reach `wire.Config.OnNotice` from that
+goroutine. Once the server has refused the copy, a duplicate key say, the rows
+still to come are neither pulled from the source nor sent.
+
 ### Pipeline
 
 A batch is one transaction: the first statement that fails ends it. A pipeline
@@ -404,6 +414,17 @@ trip, its description remembered on the client. pgx's fastest such mode,
 `QueryExecModeCacheDescribe`, is the one shown; `QueryExecModeExec` takes
 83.0 µs, and caduceus remembering nothing, asking every time, 120 µs.
 
+database/sql over caduceus's own driver, `caduceus/stdlib`, measured the same
+way in two 2,000-iteration runs, each cell wall time · client CPU · memory
+allocated, against database/sql over pgx in the same runs: QueryRow 48–55 µs ·
+32–39 µs · 654 B against 68–76 µs · 61–73 µs · 759 B; BEGIN, INSERT, COMMIT
+148–161 µs · 127–136 µs · 653 B against 208–217 µs · 184–197 µs · 729 B. 100
+rows of four columns is level, 169–175 µs · 103–107 µs against 164–182 µs ·
+105–121 µs, and allocates more, 12.5 KiB against 8.2 KiB: database/sql takes
+every column as an interface value, and caduceus's text columns arrive there
+as strings, each a value of its own. caduceus called directly allocates 1.9
+KiB for the same rows.
+
 ### A million rows
 
 Each cell is wall time · client CPU · memory allocated, for one pass over a
@@ -452,6 +473,8 @@ reach an application that imports caduceus.
 | `caduceus/wire` | the frontend/backend protocol, version 3.0: config, TLS, auth, framing, errors, cancel, notifications, CopyBoth |
 | `caduceus/codec` | Go values to and from PostgreSQL's text and binary formats |
 | `caduceus/replication` | logical replication: pgoutput decoding, stream messages, LSNs |
+| `caduceus/stdlib` | the `database/sql` driver, registered as `caduceus` |
+| `caduceus/gss` | Kerberos login, `wire.Config.NewGSS = gss.New`; a module of its own, on gokrb5, so that only a program that asks for Kerberos downloads it |
 
 ## Testing
 

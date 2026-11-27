@@ -221,7 +221,7 @@ func (s *Conn) readDescriptions(stmts []*statement) error {
 				fields, err = wire.ParseRowDescription(nil, body)
 			}
 			if next < len(stmts) {
-				*stmts[next] = *newStatement(stmts[next].name, stmts[next].sql, params, fields, s.binary)
+				*stmts[next] = *newStatement(stmts[next].name, stmts[next].sql, params, fields, s.format)
 				next++
 			}
 		case wire.MsgErrorResponse:

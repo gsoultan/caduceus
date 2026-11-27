@@ -77,7 +77,9 @@ type Conn struct {
 	// last exchange began. Between exchanges that is a wait ending; inside one
 	// it is a reply left unread, which the exchange's Guard answers by closing
 	// the connection.
-	overdue bool
+	// It is atomic because a COPY reads its replies on a goroutine of its
+	// own while it writes.
+	overdue atomic.Bool
 	// wrote is anything written since Watch, which is what makes an exchange
 	// that failed unsafe to retry.
 	wrote bool
@@ -153,7 +155,9 @@ func (c *Conn) Write(messages []byte) error {
 // have gone out, and returns the error. One that ran into a deadline is
 // remembered for the exchange's Guard, which says whose deadline it was.
 func (c *Conn) unsent(err error) error {
-	c.overdue = c.overdue || isTimeout(err)
+	if isTimeout(err) {
+		c.overdue.Store(true)
+	}
 	return c.fail(err)
 }
 
