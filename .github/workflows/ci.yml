@@ -31,13 +31,13 @@ jobs:
             echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
           fi
       # The benchmarks are a module of their own, so vet them separately.
-      - run: go vet ./... && (cd benchmarks && go vet ./...)
+      - run: go vet ./... && (cd benchmarks && go vet ./...) && (cd gss && go vet ./...)
       - name: The core module requires nothing
         run: |
           if grep -q '^require' go.mod; then
             echo "::error::caduceus must not depend on any module"; exit 1
           fi
-      - run: go test -race -count=1 ./...
+      - run: go test -race -count=1 ./... && (cd gss && go test -race -count=1 ./...)
 
   live:
     name: Against PostgreSQL ${{ matrix.postgres }}

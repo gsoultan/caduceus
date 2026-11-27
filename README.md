@@ -460,6 +460,7 @@ reach an application that imports caduceus.
 | `caduceus/wire` | the frontend/backend protocol, version 3.0: config, TLS, auth, framing, errors, cancel, notifications, CopyBoth |
 | `caduceus/codec` | Go values to and from PostgreSQL's text and binary formats |
 | `caduceus/replication` | logical replication: pgoutput decoding, stream messages, LSNs |
+| `caduceus/gss` | Kerberos login, `wire.Config.NewGSS = gss.New`; a module of its own, on gokrb5, so that only a program that asks for Kerberos downloads it |
 
 ## Testing
 
