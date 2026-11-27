@@ -64,6 +64,18 @@ type Config struct {
 	// not, with ErrChannelBinding.
 	ChannelBinding string
 
+	// NewGSS makes the GSSAPI client a login with Kerberos uses, once for
+	// each such login. Nil refuses one with ErrNoGSS. gss.New, from the
+	// module github.com/gsoultan/caduceus/gss, is one, and caduceus requires
+	// nothing so that only a program that sets it pulls a Kerberos library in.
+	NewGSS func() (GSS, error)
+	// KerberosServiceName is libpq's krbsrvname, the service part of the
+	// server's principal: postgres, for empty, as in libpq. KerberosSPN,
+	// pgx's krbspn, names the principal in full instead, for a server whose
+	// principal is not service/host.
+	KerberosServiceName string
+	KerberosSPN         string
+
 	// ConnectTimeout bounds dialling and logging in when the caller's context
 	// has no earlier deadline. Zero means only the context bounds it.
 	ConnectTimeout time.Duration

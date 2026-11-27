@@ -20,6 +20,9 @@ const (
 	authOK           = 0
 	authCleartext    = 3
 	authMD5          = 5
+	authGSS          = 7
+	authGSSContinue  = 8
+	authSSPI         = 9
 	authSASL         = 10
 	authSASLContinue = 11
 	authSASLFinal    = 12
@@ -308,6 +311,7 @@ func (c *Conn) startupMessage() []byte {
 type authenticator struct {
 	conn     *Conn
 	scram    *scramClient
+	gss      GSS
 	verified bool
 	policy   authPolicy
 	// asked is a method asked for, and bound a SCRAM bound to the TLS
@@ -324,6 +328,12 @@ func (a *authenticator) requireBinding() bool {
 // password checks that the server may ask for the password as method, in
 // the clear or hashed with MD5, before it is sent.
 func (a *authenticator) password(method string) error {
+	return a.method(method)
+}
+
+// method checks that the server may ask for method, one that does not bind
+// to the TLS connection.
+func (a *authenticator) method(method string) error {
 	a.asked = true
 	if err := a.policy.check(method); err != nil {
 		return err
@@ -375,6 +385,12 @@ func (a *authenticator) handle(body []byte) error {
 			return err
 		}
 		return a.beginSCRAM(data)
+	case authGSS:
+		return a.beginGSS("gss")
+	case authSSPI:
+		return a.beginGSS("sspi")
+	case authGSSContinue:
+		return a.continueGSS(data)
 	case authSASLContinue:
 		return a.continueSCRAM(data)
 	case authSASLFinal:

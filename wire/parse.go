@@ -53,6 +53,7 @@ var connectionKeys = map[string]bool{
 	"min_protocol_version": true, "max_protocol_version": true,
 	"require_auth": true, "channel_binding": true, "sslnegotiation": true,
 	"service": true, "servicefile": true,
+	"krbsrvname": true, "krbspn": true, "gsslib": true, "gssencmode": true, "gssdelegation": true,
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -76,6 +77,7 @@ var environment = [][2]string{
 	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
 	{"PGREQUIREAUTH", "require_auth"}, {"PGCHANNELBINDING", "channel_binding"},
 	{"PGSSLNEGOTIATION", "sslnegotiation"}, {"PGSSLSNI", "sslsni"},
+	{"PGKRBSRVNAME", "krbsrvname"}, {"PGGSSLIB", "gsslib"}, {"PGGSSENCMODE", "gssencmode"},
 }
 
 func parseSettings(text string) (map[string]string, error) {
@@ -189,6 +191,10 @@ func buildConfig(settings map[string]string) (*Config, error) {
 		return nil, err
 	}
 	config.RequireAuth, config.ChannelBinding = settings["require_auth"], settings["channel_binding"]
+	config.KerberosServiceName, config.KerberosSPN = settings["krbsrvname"], settings["krbspn"]
+	if settings["gssencmode"] == "require" {
+		return nil, fmt.Errorf("%w: gssencmode=require: GSSAPI encryption is not supported; use TLS, with Kerberos to log in", ErrInvalidConnString)
+	}
 	if err := config.validAuth(); err != nil {
 		return nil, err
 	}
