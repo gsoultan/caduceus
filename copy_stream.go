@@ -42,6 +42,13 @@ type copyStream struct {
 	// with a ReadyForQuery of its own.
 	statements int
 	unsent     int
+
+	// replies reads what the server sends while the rows are written, once
+	// more than copyChunk has gone out; sent counts what has, and confirmed
+	// the replies owed for it.
+	replies   *copyReplies
+	sent      int
+	confirmed int
 }
 
 // open starts the stream in binary if every column's type allows it. Nothing is
@@ -50,6 +57,23 @@ func (c *copyStream) open() {
 	c.binary = binaryColumns(c.oids)
 	c.buf = c.session.conn.Buffer()
 	c.begin()
+}
+
+// send writes buf, after starting to read the replies if it takes what has
+// gone out past copyChunk. Up to that much the server's socket takes whole,
+// whether the server reads or not, so a COPY that small cannot stall and
+// needs no goroutine; it reads its replies once it is sent, as before.
+func (c *copyStream) send(buf []byte) error {
+	if c.replies == nil && c.sent+len(buf) > copyChunk {
+		c.replies = c.session.readCopyReplies(c.confirmed)
+	}
+	c.sent += len(buf)
+	c.unsent = 0
+	c.confirmed = c.owed()
+	if c.replies != nil {
+		c.replies.expect(c.confirmed)
+	}
+	return c.session.conn.Send(buf)
 }
 
 // binaryColumns reports whether every column type can be written in binary.
@@ -109,10 +133,9 @@ func (c *copyStream) write(values []any) error {
 	if len(c.buf)-c.mark < copyChunk {
 		return nil
 	}
-	if err := c.session.conn.Send(wire.FinishMessage(c.buf, c.mark)); err != nil {
+	if err := c.send(wire.FinishMessage(c.buf, c.mark)); err != nil {
 		return err
 	}
-	c.unsent = 0
 	c.buf, c.mark = wire.StartMessage(c.session.conn.Buffer(), 'd')
 	return nil
 }
@@ -155,28 +178,23 @@ func (c *copyStream) finish() error {
 	if c.own {
 		c.buf = wire.AppendQuery(c.buf, "COMMIT")
 	}
-	c.unsent = 0
-	return c.session.conn.Send(c.buf)
+	return c.send(c.buf)
 }
+
+// refused reports whether the server has already refused the COPY, so the
+// rows still to come would only be discarded.
+func (c *copyStream) refused() bool { return c.replies != nil && c.replies.failed.Load() }
 
 // result reads the reply to every statement of a finished stream and returns
 // how many rows the COPY took, summed over both parts of one that changed
 // format. The first error is the one that matters: after it the server
 // refuses a second COPY only because the first failed.
 func (c *copyStream) result() (int64, error) {
-	var total int64
-	var failure error
-	for owed := c.owed(); owed > 0; owed-- {
-		tag, err := c.session.drain(nil)
-		if err != nil && !isServerError(err) {
-			return 0, err
-		}
-		if failure == nil {
-			failure = err
-		}
-		total += CommandTag(tag).RowsAffected()
-	}
-	if failure != nil {
+	total, failure, broken := c.replied(c.owed())
+	switch {
+	case broken != nil:
+		return 0, broken
+	case failure != nil:
 		return 0, failure
 	}
 	return total, nil
@@ -207,18 +225,33 @@ func (c *copyStream) abandon(reason error) error {
 		buf = wire.AppendQuery(buf, "ROLLBACK")
 	}
 	owed := c.owed()
-	if owed == 0 {
-		return reason
-	}
-	if err := c.session.conn.Send(buf); err != nil {
-		return err
-	}
-	for ; owed > 0; owed-- {
-		if _, err := c.session.drain(nil); err != nil && !isServerError(err) {
-			return err
+	if owed > 0 {
+		if err := c.session.conn.Send(buf); err != nil {
+			reason = err
 		}
 	}
+	if _, _, broken := c.replied(owed); broken != nil {
+		return broken
+	}
 	return reason
+}
+
+// replied waits for the replies to owed statements, read as they came or,
+// for a COPY too small to need that, now.
+func (c *copyStream) replied(owed int) (total int64, failure, broken error) {
+	if c.replies != nil {
+		total, _, failure, broken = c.replies.wait(owed)
+		return total, failure, broken
+	}
+	for ; owed > 0; owed-- {
+		tag, err := c.session.drain(nil)
+		if err != nil && !isServerError(err) {
+			return 0, nil, err
+		}
+		failure = firstError(failure, err)
+		total += CommandTag(tag).RowsAffected()
+	}
+	return total, failure, nil
 }
 
 // appendCopyTuple appends one row of COPY binary format: the number of fields,

@@ -2,6 +2,8 @@
 
 package caduceus
 
+import "github.com/gsoultan/caduceus/codec"
+
 // DefaultStatementCacheCapacity is how many prepared statements a connection
 // keeps on the server when Options does not say.
 const DefaultStatementCacheCapacity = 64
@@ -48,26 +50,24 @@ type Options struct {
 	// without one pays a nil check for it and nothing more.
 	Tracer QueryTracer
 
-	// BinaryResults lists the types, by OID, whose columns are asked for in
-	// binary whatever format the codec would choose for them, such as numeric,
-	// inet, cidr or a range type, which the codec reads as text. It is for a
-	// caller that decodes RawValues itself and wants the server's binary form,
-	// as an ORM with its own decoders does. Scan and Values read such a column
-	// only where the codec reads that type in binary too, and otherwise fail
-	// with a *codec.TypeError naming the column.
-	BinaryResults []uint32
+	// ResultFormat chooses the format, 0 for text and 1 for binary, each
+	// result column of type oid is asked for in. Nil asks for the formats
+	// codec.ResultFormat gives, which every Scan destination reads.
+	//
+	// It is for a caller that reads RawValues and decodes them itself, such
+	// as an ORM whose generated scanners decode binary: numeric, jsonb, inet
+	// and cidr are asked for in text by default. A column asked for in a
+	// format the codec does not read is still given by RawValues, and Scan
+	// and Values return a *codec.TypeError for it.
+	ResultFormat func(oid uint32) int16
 }
 
-// binaryResults is BinaryResults as a set, or nil when it names nothing.
-func (o Options) binaryResults() map[uint32]bool {
-	if len(o.BinaryResults) == 0 {
-		return nil
+// resultFormat returns the function that chooses each column's format.
+func (o Options) resultFormat() func(uint32) int16 {
+	if o.ResultFormat != nil {
+		return o.ResultFormat
 	}
-	set := make(map[uint32]bool, len(o.BinaryResults))
-	for _, oid := range o.BinaryResults {
-		set[oid] = true
-	}
-	return set
+	return codec.ResultFormat
 }
 
 // statements is how many statements to keep on the server: none when the

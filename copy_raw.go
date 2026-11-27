@@ -88,7 +88,11 @@ func (s *Conn) copyFromReader(r io.Reader, sql string) (string, error) {
 		}
 		switch kind {
 		case wire.MsgCopyInResponse:
-			readErr, err := s.sendFrom(r)
+			in := copyIn{session: s}
+			readErr, err := in.sendFrom(r)
+			if in.replies != nil {
+				return in.finish(readErr, err, failure)
+			}
 			if err != nil {
 				return "", err
 			}
@@ -118,22 +122,25 @@ func (s *Conn) startCopy(sql string) error {
 // sendFrom sends what r yields as CopyData, then CopyDone, or CopyFail when a
 // read fails. It returns that read's error, and separately an error sending,
 // after which the connection is gone.
-func (s *Conn) sendFrom(r io.Reader) (readErr, sendErr error) {
+func (c *copyIn) sendFrom(r io.Reader) (readErr, sendErr error) {
+	s := c.session
 	chunk := make([]byte, copyChunk)
-	for {
+	// Once the server has refused the COPY, what is left would be discarded.
+	for !c.refused() {
 		n, err := r.Read(chunk)
 		if n > 0 {
-			if sendErr := s.conn.Send(wire.AppendCopyData(s.conn.Buffer(), chunk[:n])); sendErr != nil {
+			if sendErr := c.send(wire.AppendCopyData(s.conn.Buffer(), chunk[:n])); sendErr != nil {
 				return nil, sendErr
 			}
 		}
 		switch {
 		case errors.Is(err, io.EOF):
-			return nil, s.conn.Send(wire.AppendCopyDone(s.conn.Buffer()))
+			return nil, c.send(wire.AppendCopyDone(s.conn.Buffer()))
 		case err != nil:
-			return err, s.conn.Send(wire.AppendCopyFail(s.conn.Buffer(), "caduceus: reading the data to copy failed"))
+			return err, c.send(wire.AppendCopyFail(s.conn.Buffer(), "caduceus: reading the data to copy failed"))
 		}
 	}
+	return nil, c.send(wire.AppendCopyDone(s.conn.Buffer()))
 }
 
 // firstError keeps the first of an exchange's errors.
