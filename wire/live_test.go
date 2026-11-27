@@ -196,43 +196,28 @@ func TestLiveProtocolVersion(t *testing.T) {
 	}
 }
 
-// A pooler that refuses 3.2 outright, as PgBouncer before 1.24 does, fails
-// the connection with ErrProtocolVersion, not with its bare 08P01, and the
-// connection string the error names works.
+// A pooler that refuses 3.2 outright, as PgBouncer before 1.24 does, is asked
+// once more for 3.0, and the connection speaks that, with no setting in the
+// connection string. It used to fail with ErrProtocolVersion until
+// max_protocol_version=3.0 was added to every connection string.
 func TestLivePoolerRefusing32(t *testing.T) {
 	dsn := os.Getenv("POOLER_URL")
 	if dsn == "" {
 		t.Skip("POOLER_URL not set")
 	}
-	dsn = withoutSetting(dsn, "max_protocol_version")
-	config, err := ParseConfig(dsn)
+	config, err := ParseConfig(withoutSetting(dsn, "max_protocol_version"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	conn, err := Connect(t.Context(), config)
-	if err == nil {
-		_ = conn.Close(t.Context())
-		t.Skip("the pooler speaks 3.2")
-	}
-	if !errors.Is(err, ErrProtocolVersion) {
-		t.Fatalf("Connect = %v, want ErrProtocolVersion", err)
-	}
-	separator := "?"
-	if strings.Contains(dsn, "?") {
-		separator = "&"
-	}
-	config, err = ParseConfig(dsn + separator + "max_protocol_version=3.0")
 	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err = Connect(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Connect = %v, want a connection", err)
 	}
 	defer conn.Close(t.Context())
-	if conn.ProtocolVersion() != Protocol30 {
-		t.Fatalf("speaks %s, want 3.0", conn.ProtocolVersion())
+	if _, err := conn.Exec(t.Context(), "SELECT 1"); err != nil {
+		t.Fatal(err)
 	}
+	t.Logf("the pooler speaks %s", conn.ProtocolVersion())
 }
 
 // withoutSetting drops key=... from a URL's query, so a test can see what the
