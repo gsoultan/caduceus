@@ -26,6 +26,9 @@ type Conn struct {
 	// every Sync that runs it, so that nothing on the server outlives a Sync.
 	cache   *statementCache
 	unnamed bool
+	// binary holds the types Options.BinaryResults asks for in binary, or is
+	// nil when it asks for none.
+	binary map[uint32]bool
 	// closing are evicted statements still to be closed on the server. They are
 	// sent ahead of the next Parse, so eviction costs no round trip of its own.
 	closing []string
@@ -323,7 +326,7 @@ func (s *Conn) readDescription(name, sql string) (*statement, error) {
 			if failure != nil {
 				return nil, failure
 			}
-			return newStatement(name, sql, params, fields), nil
+			return newStatement(name, sql, params, fields, s.binary), nil
 		}
 		if err != nil {
 			return nil, err

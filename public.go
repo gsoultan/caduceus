@@ -50,10 +50,11 @@ func connect(ctx context.Context, config *wire.Config, options Options) (*Conn, 
 // serialise them itself.
 func New(conn *wire.Conn, options Options) *Conn {
 	trace := newTracers(options.Tracer)
+	binary := options.binaryResults()
 	if n := options.statements(); n > 0 {
-		return &Conn{conn: conn, cache: newStatementCache(n), trace: trace}
+		return &Conn{conn: conn, cache: newStatementCache(n), binary: binary, trace: trace}
 	}
-	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true, trace: trace}
+	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true, binary: binary, trace: trace}
 }
 
 // Exec runs a statement and returns its command tag, such as "UPDATE 3",

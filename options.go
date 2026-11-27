@@ -47,6 +47,27 @@ type Options struct {
 	// PrepareTracer or a ConnectTracer is told of those too. A connection
 	// without one pays a nil check for it and nothing more.
 	Tracer QueryTracer
+
+	// BinaryResults lists the types, by OID, whose columns are asked for in
+	// binary whatever format the codec would choose for them, such as numeric,
+	// inet, cidr or a range type, which the codec reads as text. It is for a
+	// caller that decodes RawValues itself and wants the server's binary form,
+	// as an ORM with its own decoders does. Scan and Values read such a column
+	// only where the codec reads that type in binary too, and otherwise fail
+	// with a *codec.TypeError naming the column.
+	BinaryResults []uint32
+}
+
+// binaryResults is BinaryResults as a set, or nil when it names nothing.
+func (o Options) binaryResults() map[uint32]bool {
+	if len(o.BinaryResults) == 0 {
+		return nil
+	}
+	set := make(map[uint32]bool, len(o.BinaryResults))
+	for _, oid := range o.BinaryResults {
+		set[oid] = true
+	}
+	return set
 }
 
 // statements is how many statements to keep on the server: none when the

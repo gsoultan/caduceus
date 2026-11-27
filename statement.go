@@ -34,12 +34,18 @@ type statement struct {
 }
 
 // newStatement builds a statement from a ParameterDescription and an optional
-// RowDescription. The fields are given the format they will arrive in.
-func newStatement(name, sql string, params []uint32, fields []wire.Field) *statement {
+// RowDescription. The fields are given the format they will arrive in: the
+// codec's choice for the type, or binary for a type in binary, the set of
+// types Options.BinaryResults asks for in binary whatever the codec would
+// choose.
+func newStatement(name, sql string, params []uint32, fields []wire.Field, binary map[uint32]bool) *statement {
 	s := &statement{name: name, sql: sql, params: params, fields: fields}
 	allText, allBinary := true, true
 	for i := range s.fields {
 		format := codec.ResultFormat(s.fields[i].DataTypeOID)
+		if binary[s.fields[i].DataTypeOID] {
+			format = wire.BinaryFormat
+		}
 		s.fields[i].Format = format
 		allText = allText && format == wire.TextFormat
 		allBinary = allBinary && format == wire.BinaryFormat
