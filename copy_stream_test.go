@@ -163,6 +163,28 @@ func TestCopyStreamStartsInTextWhenTheFirstRowNeedsIt(t *testing.T) {
 	}
 }
 
+// A row whose other column has no binary form turns the stream to text, and a
+// BinaryParam that is a TextMarshaler too is written there as its text.
+func TestCopyStreamWritesABinaryParamInText(t *testing.T) {
+	const tstzrange, inet = 3910, 869
+	stream := streamOf(tstzrange, inet)
+	encodeAll(t, stream, []any{textParam{rawParam{1}, "[1,2)"}, "10.0.0.1"})
+	if got, want := strings.Join(messages(t, stream.buf), " | "), "Q COPY t (a, b) FROM STDIN | d | c"; got != want {
+		t.Fatalf("stream sent %q\nwant %q", got, want)
+	}
+	if !bytes.Contains(stream.buf, []byte("[1,2)\t10.0.0.1\n")) {
+		t.Fatalf("text row missing from %q", stream.buf)
+	}
+}
+
+// textParam is a rawParam with a text form.
+type textParam struct {
+	rawParam
+	text string
+}
+
+func (p textParam) MarshalText() ([]byte, error) { return []byte(p.text), nil }
+
 // rawParam is a BinaryParam that writes one byte.
 type rawParam struct{ b byte }
 
