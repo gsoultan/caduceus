@@ -75,3 +75,25 @@ func TestLiveBinaryResultsAndBinaryParam(t *testing.T) {
 		}
 	}
 }
+
+// The slice fast path against a server: each array goes in binary and comes
+// back as the server read it.
+func TestLiveSliceParameters(t *testing.T) {
+	conn := liveConn(t, Options{})
+	ctx := t.Context()
+	id := [16]byte{0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11}
+	var got string
+	err := conn.QueryRow(ctx, "SELECT $1::int8[]::text || $2::int4[]::text || $3::float8[]::text || $4::bool[]::text || $5::uuid[]::text || $6::text[]::text || $7::varchar[]::text",
+		[]int64{1, -2}, []int32{3}, []float64{1.5}, []bool{true, false}, [][16]byte{id}, []string{"a", `b "c"`, ""}, []string{"x"}).Scan(&got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{1,-2}{3}{1.5}{t,f}{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}{a,"b \"c\"",""}{x}`
+	if got != want {
+		t.Errorf("got %s\nwant %s", got, want)
+	}
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT cardinality($1::int8[])", []int64{}).Scan(&n); err != nil || n != 0 {
+		t.Errorf("an empty int8[] read as %d elements: %v", n, err)
+	}
+}

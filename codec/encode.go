@@ -84,6 +84,10 @@ func Encode(dst []byte, oid uint32, arg any) ([]byte, int16, bool, error) {
 			return dst, 0, true, nil
 		}
 		return append(dst, v...), 0, false, nil
+	case []int64, []int32, []float64, []bool, [][16]byte, []string:
+		if out, format, null, ok, err := encodeSlice(dst, oid, arg); ok {
+			return out, format, null, err
+		}
 	case *string, *int64, *int32, *int16, *int, *float64, *bool, *time.Time, *[16]byte, *[]byte:
 		out, format, null, _, err := encodePointer(dst, oid, arg)
 		return out, format, null, err
