@@ -238,6 +238,14 @@ else. A value only the server can read, such as the string `"42"` for an integer
 column, is not refused: from that row on the rows go in text, as a second COPY
 that commits or fails together with the first.
 
+A copy of more than 64 KiB reads the server's replies on a goroutine of its own
+while it writes, for `CopyFrom` and `CopyFromReader` alike. A server that
+answers rows with notices, from a trigger that raises one per row, writes as
+much as it reads, and a client that only wrote would leave both waiting on
+each other until the deadline. Notices reach `wire.Config.OnNotice` from that
+goroutine. Once the server has refused the copy, a duplicate key say, the rows
+still to come are neither pulled from the source nor sent.
+
 ### Pipeline
 
 A batch is one transaction: the first statement that fails ends it. A pipeline

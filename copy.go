@@ -61,6 +61,7 @@ func (s *Conn) copyRows(request copyRequest) (int64, error) {
 		return 0, stream.abandon(err)
 	}
 	if err := stream.finish(); err != nil {
+		_, _ = stream.result()
 		return 0, err
 	}
 	return stream.result()
@@ -127,7 +128,9 @@ func (s *Conn) rollbackOwn() error {
 
 // sendRows writes every row of the source to the stream.
 func sendRows(stream *copyStream, rows CopySource) error {
-	for rows.Next() {
+	// Once the server has refused the COPY the rest would be discarded, so
+	// the stream ends, and the refusal is what result reports.
+	for !stream.refused() && rows.Next() {
 		values, err := rows.Values()
 		if err != nil {
 			return err

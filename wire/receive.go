@@ -131,7 +131,7 @@ func (c *Conn) fill(n int) error {
 			return nil
 		}
 		if isTimeout(err) {
-			c.overdue = true
+			c.overdue.Store(true)
 			return err
 		}
 		return c.fail(err)

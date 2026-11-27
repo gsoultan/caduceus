@@ -27,7 +27,8 @@ type Guard struct {
 // is blocked, that call returns a timeout, which Done turns into ctx's error.
 func (c *Conn) Watch(ctx context.Context) Guard {
 	g := Guard{conn: c, ctx: ctx}
-	c.overdue, c.wrote = false, false
+	c.overdue.Store(false)
+	c.wrote = false
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetDeadline(deadline)
 		g.deadline = true
@@ -68,7 +69,7 @@ func (g Guard) Done(err error) error {
 // done is Done without marking the error.
 func (g Guard) done(err error) error {
 	fired := g.stop != nil && !g.stop()
-	if !fired && !g.conn.overdue {
+	if !fired && !g.conn.overdue.Load() {
 		if g.deadline && !g.conn.closed.Load() {
 			_ = g.conn.netConn.SetDeadline(time.Time{})
 		}
