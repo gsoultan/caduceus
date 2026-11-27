@@ -51,10 +51,15 @@ type copyStream struct {
 	confirmed int
 }
 
-// open starts the stream in binary if every column's type allows it. Nothing is
-// sent yet: the COPY command travels with the first chunk of rows.
+// open starts the stream in binary. Whether a row can be written in binary is
+// a question about its values as much as its columns' types: a BinaryParam
+// writes itself in binary for a type codec has no encoder for, such as
+// tstzrange, and has no text form to fall back on. So the first row that
+// cannot be written in binary changes the stream to text (see encode), and a
+// stream that changes before any row went out costs nothing. Nothing is sent
+// yet: the COPY command travels with the first chunk of rows.
 func (c *copyStream) open() {
-	c.binary = binaryColumns(c.oids)
+	c.binary = true
 	c.buf = c.session.conn.Buffer()
 	c.begin()
 }
@@ -74,18 +79,6 @@ func (c *copyStream) send(buf []byte) error {
 		c.replies.expect(c.confirmed)
 	}
 	return c.session.conn.Send(buf)
-}
-
-// binaryColumns reports whether every column type can be written in binary.
-// COPY has one format for all its columns, so a single type that cannot makes
-// the whole of it text.
-func binaryColumns(oids []uint32) bool {
-	for _, oid := range oids {
-		if !codec.BinaryInput(oid) {
-			return false
-		}
-	}
-	return true
 }
 
 // begin appends the COPY command for the current format and starts the first
