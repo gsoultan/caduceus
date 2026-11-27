@@ -259,3 +259,81 @@ func TestEncodeRefusesFloatOverflowingReal(t *testing.T) {
 		}
 	}
 }
+
+// A pointer to a basic type encodes as its value, and a nil one as NULL,
+// without going through reflection.
+func TestEncodePointerToABasicType(t *testing.T) {
+	s, n, b, u := "x", int64(7), true, [16]byte{1}
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, c := range []struct {
+		oid uint32
+		arg any
+		ptr any
+	}{
+		{Text, s, &s}, {Int8, n, &n}, {Bool, b, &b}, {UUID, u, &u}, {Timestamptz, ts, &ts},
+	} {
+		want, wf, _, err := Encode(nil, c.oid, c.arg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, gf, null, err := Encode(nil, c.oid, c.ptr)
+		if err != nil || null || gf != wf || string(got) != string(want) {
+			t.Errorf("%T: %x (format %d, null %v, %v), want %x (format %d)", c.ptr, got, gf, null, err, want, wf)
+		}
+	}
+	if _, _, null, err := Encode(nil, Int8, (*int64)(nil)); err != nil || !null {
+		t.Errorf("nil *int64: null = %v, %v; want NULL", null, err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _, _, _, _ = Encode(make([]byte, 0, 16), Int8, &n) }); allocs > 1 {
+		t.Errorf("*int64 costs %v allocations, want at most the buffer's", allocs)
+	}
+}
+
+// The slice fast path must write what the general path writes, element for
+// element, for every pairing it takes over from it.
+func TestEncodeSliceMatchesTheGeneralPath(t *testing.T) {
+	id := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	for _, c := range []struct {
+		oid uint32
+		arg any
+	}{
+		{1016, []int64{1, -2, math.MaxInt64}},
+		{1007, []int32{1, -2, math.MaxInt32}},
+		{1022, []float64{1.5, -0.25}},
+		{1000, []bool{true, false}},
+		{1016, []int64{}},
+	} {
+		got, format, null, err := Encode(nil, c.oid, c.arg)
+		if err != nil || null || format != 1 {
+			t.Fatalf("%T: format %d null %v err %v", c.arg, format, null, err)
+		}
+		want, _, _, err := encodeReflect(nil, c.oid, c.arg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("%T: fast path wrote %x, general path %x", c.arg, got, want)
+		}
+	}
+	if _, _, null, err := Encode(nil, 1016, []int64(nil)); !null || err != nil {
+		t.Errorf("a nil slice is not NULL: null %v err %v", null, err)
+	}
+	// A pairing the fast path does not take still encodes, as before.
+	if out, format, _, err := Encode(nil, 1007, []int64{7}); err != nil || format != 1 || len(out) == 0 {
+		t.Errorf("[]int64 as int4[]: %x format %d err %v", out, format, err)
+	}
+	// uuid[] goes in binary, where the general path sent a literal.
+	out, format, _, err := Encode(nil, 2951, [][16]byte{id})
+	if err != nil || format != 1 || len(out) != 20+4+16 || string(out[24:]) != string(id[:]) {
+		t.Errorf("uuid[] = %x format %d err %v", out, format, err)
+	}
+	// text[] goes in binary: a header, then each string's bytes.
+	out, format, _, err = Encode(nil, 1009, []string{"a", "b,c"})
+	if err != nil || format != 1 {
+		t.Fatalf("text[]: format %d err %v", format, err)
+	}
+	want := []byte{0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, 'a', 0, 0, 0, 3, 'b', ',', 'c'}
+	if string(out) != string(want) {
+		t.Errorf("text[] = %v, want %v", out, want)
+	}
+}

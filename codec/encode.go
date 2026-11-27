@@ -26,7 +26,8 @@ import (
 // a string is accepted wherever PostgreSQL would accept it as a literal — for a
 // bytea that means its hex form, \x0102, as in SQL.
 //
-// arg may also be a Valuer, an encoding.TextMarshaler, a pointer (nil
+// arg may also be a BinaryParam, which writes itself in binary, a Valuer, an
+// encoding.TextMarshaler, a pointer (nil
 // is NULL), a named type of a basic kind, a slice for an array type, and for
 // json and jsonb any value encoding/json can marshal.
 func Encode(dst []byte, oid uint32, arg any) ([]byte, int16, bool, error) {
@@ -83,6 +84,23 @@ func Encode(dst []byte, oid uint32, arg any) ([]byte, int16, bool, error) {
 			return dst, 0, true, nil
 		}
 		return append(dst, v...), 0, false, nil
+	case []int64, []int32, []float64, []bool, [][16]byte, []string:
+		if out, format, null, ok, err := encodeSlice(dst, oid, arg); ok {
+			return out, format, null, err
+		}
+	case *string, *int64, *int32, *int16, *int, *float64, *bool, *time.Time, *[16]byte, *[]byte:
+		out, format, null, _, err := encodePointer(dst, oid, arg)
+		return out, format, null, err
+	case BinaryParam:
+		if isNilPointer(arg) {
+			return dst, 1, true, nil
+		}
+		start := len(dst)
+		out, null, err := v.AppendBinaryParam(dst, oid)
+		if err != nil || null {
+			return dst[:start], 1, null, err
+		}
+		return out, 1, false, nil
 	case columnEncoder:
 		if isNilPointer(arg) {
 			return dst, 0, true, nil
