@@ -1,7 +1,8 @@
 # caduceus
 
 A PostgreSQL driver for Go, written from the protocol up. Pure Go, standard
-library only: no `database/sql`, no pgx, no pglogrepl. `go.mod` requires nothing.
+library only: no pgx, no pglogrepl. `go.mod` requires nothing. `caduceus` itself does
+not use `database/sql`; package `caduceus/stdlib` is its driver for code that does.
 
 ```go
 import "github.com/gsoultan/caduceus"
@@ -37,6 +38,7 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
 | **Types** | integers, floats, numeric (into `*big.Rat`, `*big.Float`, a float or a string, and from `*big.Rat` as its exact decimal), bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, enums and domains as their text; `inet`/`cidr` into `netip.Addr`, `netip.Prefix`, `net.IP` or `net.IPNet`, `macaddr` into `net.HardwareAddr`; arrays of every type, as slices, nested for more dimensions; `codec.Range[T]` and `codec.Multirange[T]` for the range types and your own; `codec.Hstore`; `codec.Bits` for bit and varbit; `codec.Point`, `Box`, `Lseg`, `Line`, `Circle`, `Path`, `Polygon`; `codec.CompositeFields` for a record or a composite type's row, in and out; `codec.Scanner` and `codec.Valuer` for your own types; a pointer destination receives NULL |
 | **Errors** | `*wire.Error` with the SQLSTATE and every field the server sends; classify by `SQLState()`, never by message text. `wire.SafeToRetry(err)` holds for what never reached the server: nothing of it was written, as for a busy or closed connection, a context already over, or arguments that do not fit, so running it again cannot run it twice. `wire.Timeout(err)` holds for a deadline, the context's or the socket's. A failed connect is a `*wire.ConnectError` naming host, port, user and database, never the password; a connection string that does not parse is `ErrInvalidConnString`, which never quotes it |
+| **database/sql** | package `stdlib` registers the driver `caduceus`: `sql.Open("caduceus", dsn)`, or `stdlib.OpenDB(config, options)` from a `wire.Config`. Arguments are bound as caduceus binds them, so a slice is an array and a `driver.Valuer` is called, nil pointer as NULL; `$1` placeholders, or a `caduceus.NamedArgs` as the only argument for `@name`, and `sql.Named` refused. Columns come back as `int64`, `float64`, `bool`, `[]byte`, `time.Time`, and otherwise PostgreSQL's text as a `string` (numeric, uuid, interval, json, arrays). `BeginTx` maps the isolation levels PostgreSQL has and refuses the rest; `DB.Prepare` prepares on the server and `Stmt.Close` deallocates there. A connection the server ended while idle is found by `CheckConn` before it is handed out, so the caller gets a fresh one rather than the error. `sql.Conn.Raw` gives the `*caduceus.Conn` underneath, for COPY and batches |
 | **Logical replication** | package `replication`: `ParseMessage` for every pgoutput message of protocol 1 to 4 (streamed, two-phase, origin, logical messages), XLogData, keepalives, `SendStandbyStatusUpdate`, LSNs, and the walsender commands `IdentifySystem`, `CreateReplicationSlot`, `DropReplicationSlot`, `ReadReplicationSlot`, `TimelineHistoryFile` and `StartReplication`, with `PgoutputOptions` for the plugin arguments. Slot names are checked against `ValidSlotName`, literals go through the replication grammar's `QuoteLiteral`. Physical `BASE_BACKUP` is not provided. |
 
 ### Transactions
@@ -412,6 +414,17 @@ trip, its description remembered on the client. pgx's fastest such mode,
 `QueryExecModeCacheDescribe`, is the one shown; `QueryExecModeExec` takes
 83.0 µs, and caduceus remembering nothing, asking every time, 120 µs.
 
+database/sql over caduceus's own driver, `caduceus/stdlib`, measured the same
+way in two 2,000-iteration runs, each cell wall time · client CPU · memory
+allocated, against database/sql over pgx in the same runs: QueryRow 48–55 µs ·
+32–39 µs · 654 B against 68–76 µs · 61–73 µs · 759 B; BEGIN, INSERT, COMMIT
+148–161 µs · 127–136 µs · 653 B against 208–217 µs · 184–197 µs · 729 B. 100
+rows of four columns is level, 169–175 µs · 103–107 µs against 164–182 µs ·
+105–121 µs, and allocates more, 12.5 KiB against 8.2 KiB: database/sql takes
+every column as an interface value, and caduceus's text columns arrive there
+as strings, each a value of its own. caduceus called directly allocates 1.9
+KiB for the same rows.
+
 ### A million rows
 
 Each cell is wall time · client CPU · memory allocated, for one pass over a
@@ -460,6 +473,7 @@ reach an application that imports caduceus.
 | `caduceus/wire` | the frontend/backend protocol, version 3.0: config, TLS, auth, framing, errors, cancel, notifications, CopyBoth |
 | `caduceus/codec` | Go values to and from PostgreSQL's text and binary formats |
 | `caduceus/replication` | logical replication: pgoutput decoding, stream messages, LSNs |
+| `caduceus/stdlib` | the `database/sql` driver, registered as `caduceus` |
 | `caduceus/gss` | Kerberos login, `wire.Config.NewGSS = gss.New`; a module of its own, on gokrb5, so that only a program that asks for Kerberos downloads it |
 
 ## Testing

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gsoultan/caduceus"
+	_ "github.com/gsoultan/caduceus/stdlib"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/lib/pq"
@@ -19,8 +20,8 @@ import (
 
 // caduceus against its competitors, each on one connection with one caller,
 // so a number is the driver's cost per operation with no pool or queueing in
-// it. database/sql runs twice, over pgx's stdlib driver and over lib/pq, with
-// its pool held to one connection.
+// it. database/sql runs three times, over caduceus/stdlib, over pgx's stdlib
+// driver and over lib/pq, with its pool held to one connection.
 //
 // "SELECT 1" barely touches a driver, so these workloads bind parameters,
 // decode typed rows, run transactions, pipeline batches and copy rows, which
@@ -63,8 +64,8 @@ func scanRows(b *testing.B, next func() bool, scan func(...any) error) int {
 }
 
 // sqlPool is the database/sql side of a benchmark: the same closures run
-// once over pgx's stdlib driver and once over lib/pq, with DB switched between
-// them by runAll.
+// over caduceus/stdlib, over pgx's stdlib driver and over lib/pq, with DB
+// switched between them by runAll.
 type sqlPool struct {
 	*sql.DB
 	drivers map[string]*sql.DB
@@ -72,7 +73,7 @@ type sqlPool struct {
 
 // sqlDrivers are the database/sql drivers measured, by the name each result
 // is reported under.
-var sqlDrivers = map[string]string{"database-sql-pgx": "pgx", "lib-pq": "postgres"}
+var sqlDrivers = map[string]string{"database-sql-pgx": "pgx", "lib-pq": "postgres", "database-sql-caduceus": "caduceus"}
 
 var currentSQL *sqlPool
 
@@ -152,7 +153,7 @@ func runAll(b *testing.B, contenders []contender) {
 			expanded = append(expanded, c)
 			continue
 		}
-		for _, name := range []string{"database-sql-pgx", "lib-pq"} {
+		for _, name := range []string{"database-sql-caduceus", "database-sql-pgx", "lib-pq"} {
 			run := c.run
 			expanded = append(expanded, contender{name, func(b *testing.B, ctx context.Context) {
 				currentSQL.DB = currentSQL.drivers[name]
