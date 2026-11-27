@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,12 @@ func TestLiveLogicalReplication(t *testing.T) {
 		}
 		kinds = append(kinds, parsed.Type())
 		check(t, parsed, table)
+		// Before PostgreSQL 15, pgoutput sends every other transaction too,
+		// as a Begin and a Commit with nothing between: whatever else ran on
+		// the server meanwhile. It is not the one under test.
+		if string(kinds) == "BC" {
+			kinds = kinds[:0]
+		}
 	}
 	// pgoutput sends the relation again ahead of the truncate.
 	if string(kinds) != "BRIMRTC" {
@@ -161,12 +168,15 @@ func TestLivePhysicalReplicationAndDrop(t *testing.T) {
 			_ = conn.Close(ctx)
 		}
 	})
-	// READ_REPLICATION_SLOT reads physical slots only.
-	if state, err := ReadReplicationSlot(ctx, walsender, slot); err != nil || !state.Exists || state.Type != "physical" || state.RestartLSN == 0 {
-		t.Fatalf("ReadReplicationSlot = %+v, %v", state, err)
-	}
-	if state, err := ReadReplicationSlot(ctx, walsender, "caduceus_no_such_slot"); err != nil || state.Exists {
-		t.Fatalf("ReadReplicationSlot of a missing slot = %+v, %v", state, err)
+	// READ_REPLICATION_SLOT reads physical slots only, and came with
+	// PostgreSQL 15: an older walsender refuses it as an SQL command.
+	if serverMajor(t, walsender) >= 15 {
+		if state, err := ReadReplicationSlot(ctx, walsender, slot); err != nil || !state.Exists || state.Type != "physical" || state.RestartLSN == 0 {
+			t.Fatalf("ReadReplicationSlot = %+v, %v", state, err)
+		}
+		if state, err := ReadReplicationSlot(ctx, walsender, "caduceus_no_such_slot"); err != nil || state.Exists {
+			t.Fatalf("ReadReplicationSlot of a missing slot = %+v, %v", state, err)
+		}
 	}
 	identity, err := IdentifySystem(ctx, walsender)
 	if err != nil || identity.Database != "" {
@@ -204,12 +214,26 @@ func TestLivePhysicalReplicationAndDrop(t *testing.T) {
 	if err := <-dropped; err != nil {
 		t.Fatal(err)
 	}
-	if state, err := ReadReplicationSlot(ctx, dropper, slot); err != nil || state.Exists {
-		t.Fatalf("after DropReplicationSlot: %+v, %v", state, err)
+	if serverMajor(t, dropper) >= 15 {
+		if state, err := ReadReplicationSlot(ctx, dropper, slot); err != nil || state.Exists {
+			t.Fatalf("after DropReplicationSlot: %+v, %v", state, err)
+		}
 	}
 }
 
 func isCode(err error, code string) bool {
 	var server *wire.Error
 	return errors.As(err, &server) && server.Code == code
+}
+
+// serverMajor is the server's major version, from the server_version it
+// reported at login.
+func serverMajor(t *testing.T, conn *wire.Conn) int {
+	t.Helper()
+	major, _, _ := strings.Cut(conn.ParameterStatus("server_version"), ".")
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		t.Fatalf("server_version %q: %v", conn.ParameterStatus("server_version"), err)
+	}
+	return n
 }

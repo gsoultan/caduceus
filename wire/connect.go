@@ -68,7 +68,22 @@ func connectOnce(ctx context.Context, one *Config) (*Conn, error) {
 		ctx, cancel = context.WithTimeout(ctx, one.ConnectTimeout)
 		defer cancel()
 	}
-	return dial(ctx, one, one.firstProtocol())
+	conn, err := dial(ctx, one, one.firstProtocol())
+	if retry, ok := retryVersion(one, err); ok {
+		return dial(ctx, one, retry)
+	}
+	return conn, err
+}
+
+// retryVersion is the version to ask for once more when a startup packet's
+// version was refused outright: 3.0, if min_protocol_version allows it.
+// What 3.0 is answered with is the result, so there is one more dial at most.
+func retryVersion(config *Config, err error) (ProtocolVersion, bool) {
+	var refusal *versionRefusal
+	if !errors.As(err, &refusal) || config.minProtocol() > Protocol30 {
+		return 0, false
+	}
+	return Protocol30, true
 }
 
 // dial connects asking for a protocol version, in plaintext once more if
@@ -188,13 +203,12 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 // startupError is the server's error answering the startup packet. As the
 // first message, before any authentication, an error of protocol 08P01 or
 // 0A000 to a packet asking for more than 3.0 is most likely a refusal of the
-// version, by something in front of the server that knows only 3.0: that is
-// said, with ErrProtocolVersion, and with what to set. The connection does
-// not ask again. A current PostgreSQL offers 3.0 rather than refusing.
+// version, by something in front of the server that knows only 3.0, such as
+// PgBouncer before 1.24: it is a *versionRefusal, on which connectOnce asks
+// once more, for 3.0. A current PostgreSQL offers 3.0 rather than refusing.
 func startupError(asked ProtocolVersion, at int, failure *Error) error {
 	if at == 0 && refusesProtocol(asked, failure) {
-		return fmt.Errorf("%w: the server refused protocol %s at startup; one that speaks only 3.0 needs max_protocol_version=3.0: %w",
-			ErrProtocolVersion, asked, failure)
+		return &versionRefusal{asked: asked, failure: failure}
 	}
 	return failure
 }

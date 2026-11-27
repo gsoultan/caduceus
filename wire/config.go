@@ -100,10 +100,11 @@ type Config struct {
 	// Zero means Protocol30 and Protocol32: the connection asks for 3.2,
 	// which PostgreSQL 18 and later use, and an older server answers that it
 	// speaks 3.0, which the connection then uses. Something in front of the
-	// server that knows only 3.0 and refuses 3.2 outright fails the connection
-	// with ErrProtocolVersion; set MaxProtocolVersion to Protocol30 for it. A
-	// MinProtocolVersion of Protocol32 refuses any server that does not speak
-	// 3.2.
+	// server that knows only 3.0 and refuses 3.2 outright, such as PgBouncer
+	// before 1.24, is dialled once more asking for 3.0; a MaxProtocolVersion
+	// of Protocol30 saves that second dial. A MinProtocolVersion of
+	// Protocol32 refuses any server that does not speak 3.2, and forbids the
+	// second dial: such a refusal fails with ErrProtocolVersion.
 	MinProtocolVersion ProtocolVersion
 	MaxProtocolVersion ProtocolVersion
 
