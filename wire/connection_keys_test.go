@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,12 +118,15 @@ func TestLiveRequirePeer(t *testing.T) {
 		t.Skip("DATABASE_URL unset")
 	}
 	const dir = "/var/run/postgresql"
-	if _, err := os.Stat(dir); err != nil {
-		t.Skip("no Unix socket in " + dir)
-	}
 	tcp, err := ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The server must be on this machine, listening on the socket: in CI it
+	// runs in a container, and the directory can exist without it.
+	socket := dir + "/.s.PGSQL." + strconv.Itoa(int(tcp.Port))
+	if _, err := os.Stat(socket); err != nil {
+		t.Skip("no Unix socket at " + socket)
 	}
 	for _, tc := range []struct {
 		peer string
