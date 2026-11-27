@@ -30,6 +30,9 @@ var (
 	// this package does not implement, such as GSSAPI or SCRAM with channel
 	// binding only.
 	ErrAuthMethod = errors.New("caduceus/wire: unsupported authentication method")
+	// ErrNoGSS is a server that asked for Kerberos, gss or sspi, from a
+	// connection whose Config.NewGSS is nil.
+	ErrNoGSS = errors.New("caduceus/wire: the server asked for Kerberos (GSSAPI) and Config.NewGSS is nil: set it, to gss.New from github.com/gsoultan/caduceus/gss for one")
 
 	// ErrSCRAM is returned when the server does not hold up its half of
 	// SCRAM-SHA-256. It says no more than that: the detail would be about a secret.
