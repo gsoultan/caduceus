@@ -207,7 +207,7 @@ func (c *Rows) Scan(dest ...any) error {
 			continue
 		}
 		if err := codec.Scan(field.DataTypeOID, field.Format, value, dest[i]); err != nil {
-			return columnError(field, err)
+			return c.columnError(field, err)
 		}
 	}
 	return nil
@@ -223,9 +223,9 @@ func (c *Rows) onRow() bool {
 // arrived in a format chosen for the type it had when the statement was
 // described, that the statement's result changed since then: the statement
 // ran, and its column is not one that can be read in that format.
-func columnError(field *wire.Field, err error) error {
+func (c *Rows) columnError(field *wire.Field, err error) error {
 	var unreadable *codec.TypeError
-	if field.Format != codec.ResultFormat(field.DataTypeOID) && errors.As(err, &unreadable) {
+	if field.Format != c.session.format(field.DataTypeOID) && errors.As(err, &unreadable) {
 		return fmt.Errorf("caduceus: column %q: %w: %w", field.Name, ErrResultChanged, err)
 	}
 	return fmt.Errorf("caduceus: column %q: %w", field.Name, err)
@@ -244,7 +244,7 @@ func (c *Rows) Values() ([]any, error) {
 		field := &c.stmt.fields[i]
 		natural, err := codec.Natural(field.DataTypeOID, field.Format, value)
 		if err != nil {
-			return nil, columnError(field, err)
+			return nil, c.columnError(field, err)
 		}
 		values[i] = natural
 	}

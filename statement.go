@@ -3,7 +3,6 @@
 package caduceus
 
 import (
-	"github.com/gsoultan/caduceus/codec"
 	"github.com/gsoultan/caduceus/wire"
 )
 
@@ -34,15 +33,16 @@ type statement struct {
 }
 
 // newStatement builds a statement from a ParameterDescription and an optional
-// RowDescription. The fields are given the format they will arrive in.
-func newStatement(name, sql string, params []uint32, fields []wire.Field) *statement {
+// RowDescription. The fields are given the format they will arrive in, as
+// format chooses it.
+func newStatement(name, sql string, params []uint32, fields []wire.Field, format func(uint32) int16) *statement {
 	s := &statement{name: name, sql: sql, params: params, fields: fields}
 	allText, allBinary := true, true
 	for i := range s.fields {
-		format := codec.ResultFormat(s.fields[i].DataTypeOID)
-		s.fields[i].Format = format
-		allText = allText && format == wire.TextFormat
-		allBinary = allBinary && format == wire.BinaryFormat
+		f := format(s.fields[i].DataTypeOID)
+		s.fields[i].Format = f
+		allText = allText && f == wire.TextFormat
+		allBinary = allBinary && f == wire.BinaryFormat
 	}
 	switch {
 	case allText:

@@ -2,6 +2,8 @@
 
 package caduceus
 
+import "github.com/gsoultan/caduceus/codec"
+
 // DefaultStatementCacheCapacity is how many prepared statements a connection
 // keeps on the server when Options does not say.
 const DefaultStatementCacheCapacity = 64
@@ -47,6 +49,25 @@ type Options struct {
 	// PrepareTracer or a ConnectTracer is told of those too. A connection
 	// without one pays a nil check for it and nothing more.
 	Tracer QueryTracer
+
+	// ResultFormat chooses the format, 0 for text and 1 for binary, each
+	// result column of type oid is asked for in. Nil asks for the formats
+	// codec.ResultFormat gives, which every Scan destination reads.
+	//
+	// It is for a caller that reads RawValues and decodes them itself, such
+	// as an ORM whose generated scanners decode binary: numeric, jsonb, inet
+	// and cidr are asked for in text by default. A column asked for in a
+	// format the codec does not read is still given by RawValues, and Scan
+	// and Values return a *codec.TypeError for it.
+	ResultFormat func(oid uint32) int16
+}
+
+// resultFormat returns the function that chooses each column's format.
+func (o Options) resultFormat() func(uint32) int16 {
+	if o.ResultFormat != nil {
+		return o.ResultFormat
+	}
+	return codec.ResultFormat
 }
 
 // statements is how many statements to keep on the server: none when the

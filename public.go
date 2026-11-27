@@ -51,9 +51,9 @@ func connect(ctx context.Context, config *wire.Config, options Options) (*Conn, 
 func New(conn *wire.Conn, options Options) *Conn {
 	trace := newTracers(options.Tracer)
 	if n := options.statements(); n > 0 {
-		return &Conn{conn: conn, cache: newStatementCache(n), trace: trace}
+		return &Conn{conn: conn, cache: newStatementCache(n), trace: trace, format: options.resultFormat()}
 	}
-	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true, trace: trace}
+	return &Conn{conn: conn, cache: newStatementCache(options.descriptions()), unnamed: true, trace: trace, format: options.resultFormat()}
 }
 
 // Exec runs a statement and returns its command tag, such as "UPDATE 3",
