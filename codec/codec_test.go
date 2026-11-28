@@ -337,3 +337,25 @@ func TestEncodeSliceMatchesTheGeneralPath(t *testing.T) {
 		t.Errorf("text[] = %v, want %v", out, want)
 	}
 }
+
+// rangeParam writes itself in binary and, for a text COPY, as its literal.
+type rangeParam struct{ text string }
+
+func (p rangeParam) AppendBinaryParam(dst []byte, _ uint32) ([]byte, bool, error) {
+	return append(dst, 1), false, nil
+}
+
+func (p rangeParam) MarshalText() ([]byte, error) { return []byte(p.text), nil }
+
+// A BinaryParam in a text COPY is written as its MarshalText, for a type the
+// codec could not read its binary form back as text for.
+func TestEncodeTextOfABinaryParam(t *testing.T) {
+	const tstzrange = 3910
+	got, null, err := EncodeText(nil, tstzrange, rangeParam{`["2026-01-01 00:00:00Z",)`})
+	if err != nil || null || string(got) != `["2026-01-01 00:00:00Z",)` {
+		t.Fatalf("EncodeText = %q, %v, %v", got, null, err)
+	}
+	if _, null, err := EncodeText(nil, tstzrange, (*rangeParam)(nil)); err != nil || !null {
+		t.Fatalf("a nil *rangeParam: null %v, err %v", null, err)
+	}
+}

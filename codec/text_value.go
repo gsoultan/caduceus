@@ -3,6 +3,7 @@
 package codec
 
 import (
+	"encoding"
 	"math"
 	"strconv"
 )
@@ -12,6 +13,15 @@ import (
 func EncodeText(dst []byte, oid uint32, arg any) ([]byte, bool, error) {
 	if out, ok := appendTextFast(dst, oid, arg); ok {
 		return out, false, nil
+	}
+	if _, binary := arg.(BinaryParam); binary {
+		if marshaler, ok := arg.(encoding.TextMarshaler); ok {
+			if isNilPointer(arg) {
+				return dst, true, nil
+			}
+			text, err := marshaler.MarshalText()
+			return append(dst, text...), false, err
+		}
 	}
 	start := len(dst)
 	encoded, format, null, err := Encode(dst, oid, arg)

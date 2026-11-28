@@ -47,12 +47,6 @@ type Config struct {
 	// the handshake fails: libpq's sslmode=prefer, the default.
 	TLSFallback bool
 
-	// RequireClientCert is libpq's sslcertmode=require: the server must ask
-	// for a client certificate during the TLS handshake, which shows it
-	// checks one, or the connection fails with ErrSSLCertMode.
-	// sslcertmode=disable leaves the certificate out of TLSConfig instead.
-	RequireClientCert bool
-
 	// SSLKeyLogFile is libpq's sslkeylogfile: a file each TLS connection
 	// appends its session keys to, in the NSS key log format Wireshark reads,
 	// for debugging. It is a secret: with it, anyone holding a capture of the
@@ -116,9 +110,56 @@ type Config struct {
 	OAuthClientSecret string
 	OAuthScope        string
 
+	// KeepAlive sets TCP keepalives on a connection DialFunc does not open:
+	// libpq's keepalives_idle, keepalives_interval and keepalives_count. A
+	// zero Idle or Interval is five minutes, as before these were read, and a
+	// zero Count is the system's. NoKeepAlive, libpq's keepalives=0, turns
+	// them off. TCPUserTimeout is libpq's tcp_user_timeout, how long sent
+	// data may go unacknowledged before the connection is dropped; it is
+	// honoured on Linux, the only system with TCP_USER_TIMEOUT, and zero
+	// leaves the system's.
+	KeepAlive      net.KeepAliveConfig
+	NoKeepAlive    bool
+	TCPUserTimeout time.Duration
+
+	// LoadBalanceHosts is libpq's load_balance_hosts=random: the servers,
+	// Host and Fallbacks alike, and the addresses each resolves to, are tried
+	// in a random order on each Connect, which spreads connections across
+	// them.
+	LoadBalanceHosts bool
+
+	// RequirePeer is libpq's requirepeer: over a Unix socket, the name of the
+	// operating-system user the server must run as, checked with the
+	// socket's peer credentials before anything is sent. Empty checks
+	// nothing. It is supported on Linux; elsewhere a Unix-socket connection
+	// that sets it fails with ErrRequirePeer.
+	RequirePeer string
+
+	// SSLCertMode is libpq's sslcertmode: allow (the default, for empty)
+	// sends the client certificate if the server asks for one, disable never
+	// sends one, and require fails the connection with ErrSSLCertMode when
+	// the server does not ask.
+	SSLCertMode string
+
 	// ConnectTimeout bounds dialling and logging in when the caller's context
 	// has no earlier deadline. Zero means only the context bounds it.
 	ConnectTimeout time.Duration
+
+	// CancelDelay, when positive, keeps a connection whose context ends in the
+	// middle of an exchange. A CancelRequest is sent at once, and the
+	// exchange goes on reading the server's answer, usually an error with
+	// SQLSTATE 57014, for up to CancelDelay; the connection is closed only if
+	// that runs out. It is for a session a person drives, such as a SQL
+	// console, where cancelling a long statement must not end the session
+	// and lose its transaction, temporary tables and settings. Zero, the
+	// default, sends the CancelRequest and closes the connection at once, so a
+	// caller past its deadline never waits on the server.
+	//
+	// The cancel can arrive after the statement it was meant for has
+	// finished, as every CancelRequest can: the server then cancels whatever
+	// the connection is running when it arrives, which is nothing between
+	// exchanges, but can be the next statement if one is sent at once.
+	CancelDelay time.Duration
 
 	// MaxMessageSize bounds a single message from the server. Zero means
 	// DefaultMaxMessageSize.
@@ -166,27 +207,6 @@ type Config struct {
 	// ConnectTimeout bounds each server on its own, as libpq's does.
 	Fallbacks []*FallbackConfig
 
-	// KeepAlive configures TCP keepalives on a connection the default dialer
-	// opens: libpq's keepalives, keepalives_idle, keepalives_interval and
-	// keepalives_count. Nil probes an idle connection every five minutes; one
-	// with Enable false sends no probes.
-	KeepAlive *net.KeepAliveConfig
-	// TCPUserTimeout is libpq's tcp_user_timeout: how long data may go
-	// unacknowledged before the kernel drops the connection, on Linux, where
-	// the default dialer sets it. Zero leaves the system's default.
-	TCPUserTimeout time.Duration
-
-	// LoadBalanceHosts is libpq's load_balance_hosts=random: the servers, and
-	// the addresses LookupFunc gives for each, are tried in a random order
-	// rather than as listed, which spreads clients over them.
-	LoadBalanceHosts bool
-
-	// RequirePeer is libpq's requirepeer: on a Unix socket, the operating
-	// system user the server process must run as, which the kernel reports.
-	// A server running as another is refused with ErrRequirePeer before the
-	// password is sent. It is supported on Linux.
-	RequirePeer string
-
 	// DialFunc opens the network connection; nil dials with a net.Dialer
 	// that keeps the connection alive every five minutes, or as KeepAlive and
 	// TCPUserTimeout say. LookupFunc, if set,
@@ -214,10 +234,6 @@ type Config struct {
 func (c *Config) Copy() *Config {
 	clone := *c
 	clone.RuntimeParams = maps.Clone(c.RuntimeParams)
-	if c.KeepAlive != nil {
-		keepAlive := *c.KeepAlive
-		clone.KeepAlive = &keepAlive
-	}
 	if c.TLSConfig != nil {
 		clone.TLSConfig = c.TLSConfig.Clone()
 	}
@@ -248,14 +264,15 @@ func (c *Config) validAuth() error {
 	return fmt.Errorf("%w: channel_binding %q is not one of disable, prefer, require", ErrInvalidConnString, c.ChannelBinding)
 }
 
-// servers is where to connect, in order: Host and Port, then each fallback.
+// servers is where to connect, in order: Host and Port, then each fallback,
+// or all of them shuffled when LoadBalanceHosts is set.
 func (c *Config) servers() []FallbackConfig {
 	servers := make([]FallbackConfig, 0, 1+len(c.Fallbacks))
 	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, HostAddr: c.HostAddr, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
 	for _, fallback := range c.Fallbacks {
 		servers = append(servers, *fallback)
 	}
-	return servers
+	return ordered(c, servers)
 }
 
 // at is the configuration of a connection to one server: this one, with that
@@ -275,15 +292,28 @@ func (c *Config) dialer() func(ctx context.Context, network, address string) (ne
 	if c.DialFunc != nil {
 		return c.DialFunc
 	}
-	dialer := &net.Dialer{KeepAlive: 5 * time.Minute, Control: tcpUserTimeout(c.TCPUserTimeout)}
-	if c.KeepAlive != nil {
-		dialer.KeepAliveConfig = *c.KeepAlive
-		dialer.KeepAlive = -1
-		if c.KeepAlive.Enable {
-			dialer.KeepAlive = 0
+	return c.netDialer().DialContext
+}
+
+// netDialer is the net.Dialer a connection is opened with when DialFunc is
+// nil: keepalives as KeepAlive and NoKeepAlive say, and TCPUserTimeout.
+func (c *Config) netDialer() *net.Dialer {
+	dialer := &net.Dialer{KeepAlive: -1}
+	if !c.NoKeepAlive {
+		keepAlive := c.KeepAlive
+		keepAlive.Enable = true
+		if keepAlive.Idle == 0 {
+			keepAlive.Idle = 5 * time.Minute
 		}
+		if keepAlive.Interval == 0 {
+			keepAlive.Interval = 5 * time.Minute
+		}
+		dialer.KeepAliveConfig = keepAlive
 	}
-	return dialer.DialContext
+	if c.TCPUserTimeout > 0 {
+		dialer.Control = tcpUserTimeout(c.TCPUserTimeout)
+	}
+	return dialer
 }
 
 // lookup is LookupFunc, or, to shuffle a host's addresses for

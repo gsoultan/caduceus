@@ -21,7 +21,7 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 
 | | |
 | :--- | :--- |
-| **Connect** | URL or key=value strings, `PG*` environment variables, the password file, TLS by `sslmode` (`disable` … `verify-full`), SCRAM-SHA-256, MD5 and cleartext auth, Unix sockets. A SCRAM password goes through SASLprep as PostgreSQL prepares it, so one with full-width letters, a decomposed accent or a no-break space logs in as typed. Several hosts, `host=a,b port=5432,5433` or `postgres://a:5432,b:5433/db`, tried in order, each with its own `ConnectTimeout` and its certificate checked against its own name; a wrong password, a missing database or a missing privilege stops there. `target_session_attrs` = `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`, judged from what PostgreSQL 14 and later report at login, without a round trip. Hooks on `wire.Config`: `DialFunc`, `LookupFunc`, `ValidateConnect`, `AfterConnect`, and `Fallbacks` set directly. `service=` reads the service file (`PGSERVICEFILE`, `~/.pg_service.conf`, then `PGSYSCONFDIR`). `channel_binding` (`disable`, `prefer`, `require`) binds SCRAM to the TLS connection as SCRAM-SHA-256-PLUS. `require_auth` limits the methods the server may ask for, refused before the password is sent. `sslnegotiation=direct` starts TLS at once with ALPN `postgresql` (PostgreSQL 17 and later). `sslpassword` decrypts a client key in OpenSSL's traditional encrypted format. Kerberos (`gss`, and `sspi` answered the same way) through `wire.Config.NewGSS`, which the separate module `caduceus/gss` fills on gokrb5, so caduceus itself still requires nothing; `krbsrvname` and `krbspn` name the server's principal. GSSAPI encryption in place of TLS with `gssencmode` (`prefer`, `require`), where the provider can wrap messages (`wire.GSSWrapper`, which `caduceus/gss` implements with RFC 4121 sealed tokens); `disable`, unlike libpq's default of `prefer`, unless the connection string asks. OAuth (`OAUTHBEARER`, PostgreSQL 18) through `wire.Config.OAuthToken`, a hook asked with `oauth_issuer`, `oauth_client_id`, `oauth_client_secret` and `oauth_scope` for the bearer token; how the token is got, a device flow or a client credentials grant, is the program's, and a token the server refuses fails with what the server said of it. `require_auth` knows `oauth`. `hostaddr` dials an address while the certificate and the password file go by `host`. `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count` and, on Linux, `tcp_user_timeout` set the socket. `load_balance_hosts=random` shuffles the hosts and each host's addresses. `requirepeer` checks, on Linux, who the server on a Unix socket runs as, before anything is sent. `ssl_min_protocol_version` (TLSv1.2 by default, as in libpq) and `ssl_max_protocol_version`; `sslcrl` and `sslcrldir`, checked against every certificate of the chain, as OpenSSL checks them for libpq; `sslcertmode` (`disable`, `allow`, `require`); `sslkeylogfile`, opened per connection. `fallback_application_name`, and `PGOPTIONS`, `PGCLIENTENCODING`, `PGDATESTYLE`, `PGTZ`, `PGGEQO` and the `PG*` variable of every setting above |
+| **Connect** | URL or key=value strings, `PG*` environment variables, the password file, TLS by `sslmode` (`disable` … `verify-full`), SCRAM-SHA-256, MD5 and cleartext auth, Unix sockets. A SCRAM password goes through SASLprep as PostgreSQL prepares it, so one with full-width letters, a decomposed accent or a no-break space logs in as typed. Several hosts, `host=a,b port=5432,5433` or `postgres://a:5432,b:5433/db`, tried in order, each with its own `ConnectTimeout` and its certificate checked against its own name; a wrong password, a missing database or a missing privilege stops there. `target_session_attrs` = `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`, judged from what PostgreSQL 14 and later report at login, without a round trip. Hooks on `wire.Config`: `DialFunc`, `LookupFunc`, `ValidateConnect`, `AfterConnect`, and `Fallbacks` set directly. `service=` reads the service file (`PGSERVICEFILE`, `~/.pg_service.conf`, then `PGSYSCONFDIR`). `channel_binding` (`disable`, `prefer`, `require`) binds SCRAM to the TLS connection as SCRAM-SHA-256-PLUS. `require_auth` limits the methods the server may ask for, refused before the password is sent. `sslnegotiation=direct` starts TLS at once with ALPN `postgresql` (PostgreSQL 17 and later). `sslpassword` decrypts a client key in OpenSSL's traditional encrypted format. Kerberos (`gss`, and `sspi` answered the same way) through `wire.Config.NewGSS`, which the separate module `caduceus/gss` fills on gokrb5, so caduceus itself still requires nothing; `krbsrvname` and `krbspn` name the server's principal. GSSAPI encryption in place of TLS with `gssencmode` (`prefer`, `require`), where the provider can wrap messages (`wire.GSSWrapper`, which `caduceus/gss` implements with RFC 4121 sealed tokens); `disable`, unlike libpq's default of `prefer`, unless the connection string asks. OAuth (`OAUTHBEARER`, PostgreSQL 18) through `wire.Config.OAuthToken`, a hook asked with `oauth_issuer`, `oauth_client_id`, `oauth_client_secret` and `oauth_scope` for the bearer token; how the token is got, a device flow or a client credentials grant, is the program's, and a token the server refuses fails with what the server said of it. `require_auth` knows `oauth`. `hostaddr` dials an address while the certificate and the password file go by `host`. `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count` and, on Linux, `tcp_user_timeout` set the socket. `load_balance_hosts=random` shuffles the hosts and each host's addresses. `requirepeer` checks, on Linux, who the server on a Unix socket runs as, before anything is sent. `ssl_min_protocol_version` (TLSv1.2 by default, as in libpq) and `ssl_max_protocol_version`; `sslcrl` and `sslcrldir`, checked against every certificate of the chain, as OpenSSL checks them for libpq; `sslcertmode` (`disable`, `allow`, `require`); `sslkeylogfile`, opened per connection. `fallback_application_name`, and `PGOPTIONS`, `PGCLIENTENCODING`, `PGDATESTYLE`, `PGTZ`, `PGGEQO` and the `PG*` variable of every setting above; `requiressl`; `sslcompression`, accepted and ignored as libpq now does. None of these is sent to the server. `scram_client_key` and `scram_server_key` are refused by name |
 | **Protocol** | 3.2 with PostgreSQL 18 and later, whose cancel key is up to 256 bytes where 3.0's is 4; 3.0 with an older server: PostgreSQL 9.3 to 17 offers 3.0 in a NegotiateProtocolVersion. Something in front of the server that knows only 3.0 and refuses 3.2 outright, such as PgBouncer before 1.24, is dialled once more asking for 3.0, which the connection then speaks; `max_protocol_version=3.0` saves that second dial, and `min_protocol_version=3.2` forbids it, failing with `ErrProtocolVersion` instead. `min_protocol_version` and `max_protocol_version` (`3.0`, `3.2`, `latest`) bound it, as in libpq 18 |
 | **Query** | `Exec`, `Query`, `QueryRow`, `QueryInto`; parameters always bound server-side, never interpolated. `Exec` returns a `CommandTag`, whose `RowsAffected` counts the rows touched. Named arguments: pass `NamedArgs{"id": 42}` as the only argument and write `@id` in the SQL; `StrictNamedArgs` refuses a name that is missing or unused. Any `QueryRewriter` given as the only argument rewrites the statement first |
 | **Results** | `CollectRows`, `AppendRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`; rows into scalars (`RowTo`), maps (`RowToMap`) and structs by name or position (`RowToStructByName`, `…ByNameLax`, `…ByPos`, and `RowToAddrOf…` for pointers); `Rows.Values` decodes a row to Go values. `Options.ResultFormat` chooses the format each column is asked for in, for a caller that decodes `RawValues` itself |
@@ -33,7 +33,8 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **LISTEN/NOTIFY** | `WaitForNotification`, which never aborts a connection on timeout, or `wire.Config.OnNotification` to have each one handed over as it arrives. `wire.Config.OnNotice` gets the server's notices, such as `RAISE NOTICE` |
 | **Tracing** | `Options.Tracer` takes a `QueryTracer`, told when each statement starts and ends, with the SQL, a copy of its arguments, the command tag and the error; a query ends when its rows do. A tracer that is also a `BatchTracer`, `CopyFromTracer`, `PrepareTracer` or `ConnectTracer` is told of those too, as in pgx. The context a start returns is the one the statement runs in, so a span carries through. Without a tracer it costs nothing: `QueryRow` stays at one allocation |
 | **Health** | `Ping` makes a round trip; `CheckConn` makes none and waits for nothing, and finds a server that hung up or ended the session (FATAL 57P01, a shutdown) by looking at the socket, closing the connection if so |
-| **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection; one already over before the query is sent sends nothing and leaves the connection open. The CancelRequest goes through `DialFunc` where that is set, as the connection did |
+| **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection; one already over before the query is sent sends nothing and leaves the connection open. With `wire.Config.CancelDelay` set, the connection is kept instead: the statement fails with the server's 57014 and the session, its transaction included, goes on, as a SQL console needs. The CancelRequest goes through `DialFunc` where that is set, as the connection did |
+| **Pool** | `NewPool` / `NewPoolConfig`: a pool safe for concurrent use whose `Exec`, `Query`, `QueryRow`, `SendBatch`, `CopyFrom` and `Begin` hand back caduceus's own `*Rows`, `*Row`, `*Tx` and `*BatchResults`, so `CollectRows` and `BeginFunc` take a `*Pool` as they take a `*Conn`. `MaxConns`, `MinConns`, `MaxConnLifetime`, `MaxConnIdleTime`, `HealthCheckPeriod`, `AfterConnect` and `ResetQuery`, named as nextar names them; `pool_max_conns` and pgxpool's other URL settings are read. `Acquire` lends one connection until `Release`; `Stat` reports what pgxpool's did |
 | **Prepared statements** | `Prepare` and `Tx.Prepare` return a `StatementDescription` (parameter OIDs, result fields); every way of running a statement runs a prepared one given its name, with no Parse; `Deallocate`, `DeallocateAll`. Kept apart from the statement cache, which never evicts them, and on the server whatever the options |
 | **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
 | **Types** | integers, floats, numeric (into `*big.Rat`, `*big.Float`, a float or a string, and from `*big.Rat` as its exact decimal), bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, enums and domains as their text; `inet`/`cidr` into `netip.Addr`, `netip.Prefix`, `net.IP` or `net.IPNet`, `macaddr` into `net.HardwareAddr`; arrays of every type, as slices, nested for more dimensions; `codec.Range[T]` and `codec.Multirange[T]` for the range types and your own; `codec.Hstore`; `codec.Bits` for bit and varbit; `codec.Point`, `Box`, `Lseg`, `Line`, `Circle`, `Path`, `Polygon`; `codec.CompositeFields` for a record or a composite type's row, in and out; `codec.Scanner` and `codec.Valuer` for your own types, and `codec.BinaryParam` for one that writes its own binary form; a pointer destination receives NULL |
@@ -351,9 +352,47 @@ which has no such statement or, worse, another client's of the same name.
 A `Conn` is one connection and belongs to one goroutine at a time; it has no
 lock, because the protocol is a strict request/response sequence. A result not
 read to its end keeps the connection busy, and the next call returns
-`ErrConnBusy` rather than interleaving with it. For many goroutines, pool
-connections with [gpool](https://github.com/gsoultan/gpool), which is built on
-caduceus.
+`ErrConnBusy` rather than interleaving with it. For many goroutines, use a
+`Pool`:
+
+```go
+pool, err := caduceus.NewPool(ctx, "postgres://app:secret@db:5432/app?pool_max_conns=20")
+if err != nil {
+	return err
+}
+defer pool.Close()
+
+rows, err := pool.Query(ctx, "SELECT id, user_name, email FROM users")
+if err != nil {
+	return err
+}
+users, err := caduceus.CollectRows(rows, caduceus.RowToStructByName[User])
+
+err = caduceus.BeginFunc(ctx, pool, func(tx *caduceus.Tx) error {
+	_, err := tx.Exec(ctx, "UPDATE users SET seen_at = now() WHERE id = $1", 42)
+	return err
+})
+```
+
+Each call takes a connection and gives it back when its result is done with:
+`Exec` at once, rows once read to the end or closed, a row once scanned, a
+batch once closed, a transaction once settled. A connection given back with a
+transaction open is rolled back, and one in the middle of a result, closed,
+past `MaxConnLifetime` or whose `ResetQuery` failed is closed instead of kept.
+One idle for more than a second is checked with `CheckConn` as it is handed
+out, which costs no round trip. No more than `MaxConns` are ever open.
+
+The pool is for one program. To bound connections across many, put a pooler
+in front of the server: nextar's
+[gpoolproxy](https://github.com/gsoultan/nextar/tree/main/examples/gpoolproxy),
+or PgBouncer, in transaction mode. Both follow prepared statements from one
+server connection to the next, so the default statement cache works through
+them, as `TestLivePoolThroughPooler` checks with twelve pool connections on
+three server connections; a pooler that does not needs
+`Options.StatementCacheCapacity: -1`. A `SET` outside a transaction does not
+survive such a pooler; use `SET LOCAL` inside one. For a pool across
+databases other than PostgreSQL, or for change data capture, use
+[nextar](https://github.com/gsoultan/nextar), which is built on caduceus.
 
 ## Performance
 
@@ -484,8 +523,9 @@ DATABASE_URL='postgres://…' go test -race ./...       # adds the live tests
 ```
 
 Two more variables add tests that need more than one server. `POOLER_URL`
-names a pooler in transaction mode in front of the same server, for the tests
-of what such a pooler does to a statement. `STANDBY_URL` names a hot standby,
+names a pooler in transaction mode in front of the same server, such as
+nextar's gpoolproxy, for the tests of what such a pooler does to a statement
+and to a `Pool`. `STANDBY_URL` names a hot standby,
 which is the one place a server refuses a `BEGIN`, and which with
 `DATABASE_URL` tests `target_session_attrs`. `DATABASE_URL_SCRAM`,
 `DATABASE_URL_MD5` and `DATABASE_URL_PLAIN` name roles that log in with

@@ -36,6 +36,8 @@ type BatchResults struct {
 	// traced is the context of the batch's trace, until its tracer is told
 	// the batch has ended.
 	traced context.Context
+	// release gives a pool's connection back once the batch is closed.
+	release func()
 }
 
 // sendWindow writes the next window of a batch sent in parts.
@@ -238,6 +240,10 @@ func (b *BatchResults) Close() error {
 	if ctx := b.traced; ctx != nil {
 		b.traced = nil
 		b.session.trace.batch.TraceBatchEnd(ctx, b.session, TraceBatchEndData{Err: err})
+	}
+	if release := b.release; release != nil {
+		b.release = nil
+		release()
 	}
 	return err
 }

@@ -58,9 +58,17 @@ var connectionKeys = map[string]bool{
 	"krbsrvname": true, "krbspn": true, "gsslib": true, "gssencmode": true, "gssdelegation": true,
 	"keepalives": true, "keepalives_idle": true, "keepalives_interval": true, "keepalives_count": true,
 	"tcp_user_timeout": true, "load_balance_hosts": true, "requirepeer": true,
-	"sslcrl": true, "sslcrldir": true, "sslcertmode": true, "sslcompression": true, "sslkeylogfile": true,
+	"fallback_application_name": true, "requiressl": true,
+	"sslcrl": true, "sslcrldir": true, "sslcompression": true, "sslcertmode": true, "sslkeylogfile": true,
 	"ssl_min_protocol_version": true, "ssl_max_protocol_version": true,
-	"fallback_application_name": true,
+}
+
+// unsupportedKeys are libpq's for what caduceus does not do. Each is refused
+// by name rather than sent on, where the server would refuse it as a setting
+// it does not know.
+var unsupportedKeys = map[string]string{
+	"scram_client_key": "a SCRAM login from stored keys",
+	"scram_server_key": "a SCRAM login from stored keys",
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -84,6 +92,7 @@ var environment = [][2]string{
 	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
 	{"PGREQUIREAUTH", "require_auth"}, {"PGCHANNELBINDING", "channel_binding"},
 	{"PGSSLNEGOTIATION", "sslnegotiation"}, {"PGSSLSNI", "sslsni"},
+	{"PGTCPUSERTIMEOUT", "tcp_user_timeout"}, {"PGSSLKEYLOGFILE", "sslkeylogfile"},
 	{"PGKRBSRVNAME", "krbsrvname"}, {"PGGSSLIB", "gsslib"}, {"PGGSSENCMODE", "gssencmode"},
 	{"PGHOSTADDR", "hostaddr"}, {"PGSSLCRL", "sslcrl"}, {"PGSSLCRLDIR", "sslcrldir"},
 	{"PGSSLCERTMODE", "sslcertmode"}, {"PGSSLCOMPRESSION", "sslcompression"},
@@ -188,6 +197,14 @@ func addEnvironment(settings map[string]string) {
 }
 
 func buildConfig(settings map[string]string) (*Config, error) {
+	for key, what := range unsupportedKeys {
+		if _, set := settings[key]; set {
+			return nil, fmt.Errorf("%w: %s: %s is not supported", ErrInvalidConnString, key, what)
+		}
+	}
+	if settings["requiressl"] == "1" && settings["sslmode"] == "" {
+		settings["sslmode"] = "require"
+	}
 	config := &Config{RuntimeParams: map[string]string{}}
 	if err := config.address(settings); err != nil {
 		return nil, err
@@ -221,6 +238,9 @@ func buildConfig(settings map[string]string) (*Config, error) {
 		if !connectionKeys[key] && !clientOnlyKeys[key] {
 			config.RuntimeParams[key] = value
 		}
+	}
+	if name := settings["fallback_application_name"]; name != "" && settings["application_name"] == "" {
+		config.RuntimeParams["application_name"] = name
 	}
 	if err := config.encryption(settings); err != nil {
 		return nil, err
@@ -456,6 +476,9 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	}
 
 	config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+	if err := tlsVersions(config, settings); err != nil {
+		return nil, false, err
+	}
 	if settings["sslsni"] == "0" {
 		config.ServerName = ""
 	}
@@ -476,19 +499,8 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	if err := loadRoots(config, rootFile); err != nil {
 		return nil, false, err
 	}
-	if err := tlsVersions(config, settings); err != nil {
+	if err := verification(config, mode, settings); err != nil {
 		return nil, false, err
-	}
-	revoked, err := loadRevocations(settings["sslcrl"], settings["sslcrldir"])
-	if err != nil {
-		return nil, false, err
-	}
-	switch {
-	case config.InsecureSkipVerify:
-	case mode != "verify-full":
-		verifyChainOnly(config, revoked)
-	case revoked != nil:
-		config.VerifyConnection = func(state tls.ConnectionState) error { return revoked.check(state.VerifiedChains) }
 	}
 	if err := clientCertificate(config, settings); err != nil {
 		return nil, false, err
@@ -586,6 +598,27 @@ func decryptKey(keyPEM []byte, password string) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: der}), nil
 }
 
+// verification sets how the server's certificate is checked: not at all
+// where config skips it, which reads no revocation list, as libpq does not;
+// its chain alone, short of verify-full; or chain and name. sslcrl and
+// sslcrldir are consulted in either of the last two.
+func verification(config *tls.Config, mode string, settings map[string]string) error {
+	if config.InsecureSkipVerify {
+		return nil
+	}
+	revoked, err := loadRevocations(settings["sslcrl"], settings["sslcrldir"])
+	if err != nil {
+		return err
+	}
+	switch {
+	case mode != "verify-full":
+		verifyChainOnly(config, revoked)
+	case revoked != nil:
+		config.VerifyConnection = func(state tls.ConnectionState) error { return revoked.check(state.VerifiedChains) }
+	}
+	return nil
+}
+
 // verifyChainOnly makes a configuration check that the server's certificate
 // descends from a trusted root without checking the name on it: libpq's
 // verify-ca. crypto/tls has no such mode, so the check is done by hand.
@@ -614,4 +647,13 @@ func verifyChainOnly(config *tls.Config, revoked *revocations) {
 		}
 		return revoked.check(chains)
 	}
+}
+
+// Settings returns the settings a connection string spells out, a URL's or
+// key=value pairs, as written: nothing is read from the environment, the
+// password file or a service file, and nothing is checked. It is for a caller
+// that reads settings of its own from the string, as Pool reads pool_max_conns
+// and the like, which ParseConfig drops.
+func Settings(connString string) (map[string]string, error) {
+	return parseSettings(connString)
 }

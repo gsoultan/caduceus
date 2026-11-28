@@ -54,7 +54,7 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		return nil, err
 	}
 	a := attempt{config: config}
-	for _, server := range ordered(config, config.servers()) {
+	for _, server := range config.servers() {
 		if a.server(ctx, server) {
 			break
 		}
@@ -263,7 +263,6 @@ func (c *Conn) secure(ctx context.Context, tlsConfig *tls.Config) error {
 	if tlsConfig == nil {
 		return nil
 	}
-	tlsConfig, asked := c.certificateWatch(tlsConfig)
 	tlsConfig, keyLog, err := c.keyLog(tlsConfig)
 	if err != nil {
 		return err
@@ -275,9 +274,6 @@ func (c *Conn) secure(ctx context.Context, tlsConfig *tls.Config) error {
 		err = c.directTLS(ctx, tlsConfig)
 	} else {
 		err = c.negotiateTLS(ctx, tlsConfig)
-	}
-	if err == nil && asked != nil && !*asked {
-		return ErrSSLCertMode
 	}
 	return err
 }
@@ -299,34 +295,14 @@ func (c *Conn) keyLog(tlsConfig *tls.Config) (*tls.Config, *os.File, error) {
 	return logged, file, nil
 }
 
-// certificateWatch is tlsConfig, made for RequireClientCert to note whether
-// the server asks for a certificate, and where it notes it; or tlsConfig
-// itself and nil.
-func (c *Conn) certificateWatch(tlsConfig *tls.Config) (*tls.Config, *bool) {
-	if !c.config.RequireClientCert {
-		return tlsConfig, nil
-	}
-	watched := tlsConfig.Clone()
-	asked := new(bool)
-	certificates := watched.Certificates
-	watched.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-		*asked = true
-		if len(certificates) == 0 {
-			return &tls.Certificate{}, nil
-		}
-		return &certificates[0], nil
-	}
-	return watched, asked
-}
-
 // directTLS starts TLS at once, with the ALPN protocol postgresql, by which
 // the server knows it is not some other protocol's client, and refuses a
 // server that does not answer with it.
 func (c *Conn) directTLS(ctx context.Context, tlsConfig *tls.Config) error {
 	direct := tlsConfig.Clone()
 	direct.NextProtos = []string{alpnProtocol}
-	secured := tls.Client(c.netConn, direct)
-	if err := secured.HandshakeContext(ctx); err != nil {
+	secured, err := c.handshake(ctx, direct)
+	if err != nil {
 		return err
 	}
 	c.netConn = secured
@@ -351,8 +327,8 @@ func (c *Conn) negotiateTLS(ctx context.Context, config *tls.Config) error {
 	}
 	switch answer[0] {
 	case 'S':
-		secured := tls.Client(c.netConn, config)
-		if err := secured.HandshakeContext(ctx); err != nil {
+		secured, err := c.handshake(ctx, config)
+		if err != nil {
 			return err
 		}
 		c.netConn = secured
@@ -361,6 +337,32 @@ func (c *Conn) negotiateTLS(ctx context.Context, config *tls.Config) error {
 		return ErrTLSRefused
 	}
 	return ErrProtocol
+}
+
+// handshake runs TLS over the connection. With sslcertmode=require it fails
+// with ErrSSLCertMode unless the server asked for a client certificate, which
+// it can only do during the handshake.
+func (c *Conn) handshake(ctx context.Context, config *tls.Config) (*tls.Conn, error) {
+	asked := false
+	if c.config.SSLCertMode == "require" {
+		config = config.Clone()
+		certificates := config.Certificates
+		config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			asked = true
+			if len(certificates) == 0 {
+				return &tls.Certificate{}, nil
+			}
+			return &certificates[0], nil
+		}
+	}
+	secured := tls.Client(c.netConn, config)
+	if err := secured.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	if c.config.SSLCertMode == "require" && !asked {
+		return nil, ErrSSLCertMode
+	}
+	return secured, nil
 }
 
 func (c *Conn) startupMessage() []byte {

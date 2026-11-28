@@ -94,18 +94,20 @@ func TestHostAddrKeepsTheNameForTLS(t *testing.T) {
 	}
 }
 
+// keepalives=0 turns probes off, and a zero or missing setting leaves the
+// dialer's default, where a zero idle time used to be passed on as zero.
 func TestParseKeepAlive(t *testing.T) {
 	tests := []struct {
 		settings string
-		want     *net.KeepAliveConfig
+		want     net.KeepAliveConfig
+		off      bool
 		bad      bool
 	}{
-		{settings: "", want: nil},
-		{settings: "keepalives=0", want: &net.KeepAliveConfig{Enable: false, Idle: -1, Interval: -1, Count: -1}},
-		{settings: "keepalives=1", want: &net.KeepAliveConfig{Enable: true, Idle: -1, Interval: -1, Count: -1}},
-		{settings: "keepalives_idle=30 keepalives_interval=5 keepalives_count=3", want: &net.KeepAliveConfig{Enable: true, Idle: 30 * time.Second, Interval: 5 * time.Second, Count: 3}},
-		// Zero is the system's default, as in libpq.
-		{settings: "keepalives_idle=0 keepalives_count=0", want: &net.KeepAliveConfig{Enable: true, Idle: -1, Interval: -1, Count: -1}},
+		{settings: ""},
+		{settings: "keepalives=0", off: true},
+		{settings: "keepalives=1"},
+		{settings: "keepalives_idle=30 keepalives_interval=5 keepalives_count=3", want: net.KeepAliveConfig{Idle: 30 * time.Second, Interval: 5 * time.Second, Count: 3}},
+		{settings: "keepalives_idle=0 keepalives_count=0"},
 		{settings: "keepalives=yes", bad: true},
 		{settings: "keepalives_idle=-1", bad: true},
 		{settings: "keepalives_count=x", bad: true},
@@ -119,8 +121,8 @@ func TestParseKeepAlive(t *testing.T) {
 		if tt.bad {
 			continue
 		}
-		if (config.KeepAlive == nil) != (tt.want == nil) || (tt.want != nil && *config.KeepAlive != *tt.want) {
-			t.Errorf("%q: KeepAlive = %+v, want %+v", tt.settings, config.KeepAlive, tt.want)
+		if config.KeepAlive != tt.want || config.NoKeepAlive != tt.off {
+			t.Errorf("%q: KeepAlive = %+v, NoKeepAlive %v, want %+v, %v", tt.settings, config.KeepAlive, config.NoKeepAlive, tt.want, tt.off)
 		}
 	}
 }
@@ -174,14 +176,14 @@ func TestLoadBalanceHostsShuffles(t *testing.T) {
 	}
 	firsts := map[string]bool{}
 	for range 200 {
-		firsts[ordered(config, config.servers())[0].Host] = true
+		firsts[config.servers()[0].Host] = true
 	}
 	if len(firsts) != 3 {
 		t.Errorf("first servers over 200 tries = %v, want each of a, b and c", firsts)
 	}
 	config.LoadBalanceHosts = false
 	for range 20 {
-		if first := ordered(config, config.servers())[0].Host; first != "a" {
+		if first := config.servers()[0].Host; first != "a" {
 			t.Fatalf("without load balancing the first server was %q", first)
 		}
 	}
