@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,23 +184,23 @@ func TestRevocationLists(t *testing.T) {
 	ca.crl(t, filepath.Join(crlDir, "a.crl"), time.Now().Add(time.Hour), 42)
 
 	for _, mode := range []string{"verify-ca", "verify-full"} {
-		base := "sslmode=" + mode + " sslrootcert=" + root
+		base := "sslmode=" + mode + " sslrootcert=" + conninfo(root)
 		tests := []struct {
 			name, settings string
 			revoked        bool
 		}{
 			{"no list", "", false},
-			{"listed", " sslcrl=" + revoked, true},
-			{"listed in a directory", " sslcrldir=" + crlDir, true},
-			{"not listed", " sslcrl=" + clean, false},
-			{"list expired", " sslcrl=" + expired, true},
+			{"listed", " sslcrl=" + conninfo(revoked), true},
+			{"listed in a directory", " sslcrldir=" + conninfo(crlDir), true},
+			{"not listed", " sslcrl=" + conninfo(clean), false},
+			{"list expired", " sslcrl=" + conninfo(expired), true},
 			// A list from another authority covers nothing of this chain,
 			// which OpenSSL, and so libpq, refuses.
-			{"no list from the issuer", " sslcrl=" + foreign, true},
+			{"no list from the issuer", " sslcrl=" + conninfo(foreign), true},
 			// A list in the issuer's name it did not sign is no list from it:
 			// accepting it would let a forged, empty list clear a revoked
 			// certificate.
-			{"list not signed by the issuer", " sslcrl=" + forged, true},
+			{"list not signed by the issuer", " sslcrl=" + conninfo(forged), true},
 		}
 		for _, tt := range tests {
 			err := connectTLS(t, server, base+tt.settings)
@@ -216,7 +217,7 @@ func TestParseRevocationListErrors(t *testing.T) {
 	if err := os.WriteFile(junk, []byte("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, settings := range []string{"sslcrl=" + filepath.Join(dir, "missing"), "sslcrl=" + junk, "sslcrldir=" + dir} {
+	for _, settings := range []string{"sslcrl=" + conninfo(filepath.Join(dir, "missing")), "sslcrl=" + conninfo(junk), "sslcrldir=" + conninfo(dir)} {
 		if _, err := ParseConfig("host=localhost user=u sslmode=verify-full " + settings); !errors.Is(err, ErrInvalidConnString) {
 			t.Errorf("%s: %v, want ErrInvalidConnString", settings, err)
 		}
@@ -230,7 +231,7 @@ func TestSSLCertMode(t *testing.T) {
 	ca := newAuthority(t, "test root")
 	server := ca.issue(t, 1, false)
 	clientCertFile, clientKeyFile, _ := selfSigned(t, dir, "")
-	client := " sslcert=" + clientCertFile + " sslkey=" + clientKeyFile
+	client := " sslcert=" + conninfo(clientCertFile) + " sslkey=" + conninfo(clientKeyFile)
 
 	noRequest := &tls.Config{Certificates: []tls.Certificate{server}}
 	asks := &tls.Config{Certificates: []tls.Certificate{server}, ClientAuth: tls.RequestClientCert}
@@ -295,13 +296,13 @@ func connectErr(config *Config) error {
 func TestSSLKeyLogFile(t *testing.T) {
 	ca := newAuthority(t, "test root")
 	path := filepath.Join(t.TempDir(), "keys.log")
-	if _, err := ParseConfig("host=a user=u sslmode=require sslkeylogfile=" + path); err != nil {
+	if _, err := ParseConfig("host=a user=u sslmode=require sslkeylogfile=" + conninfo(path)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ParseConfig created the key log: %v", err)
 	}
-	if err := connectTLS(t, &tls.Config{Certificates: []tls.Certificate{ca.issue(t, 1, false)}}, "sslmode=require sslkeylogfile="+path); !reached(err) {
+	if err := connectTLS(t, &tls.Config{Certificates: []tls.Certificate{ca.issue(t, 1, false)}}, "sslmode=require sslkeylogfile="+conninfo(path)); !reached(err) {
 		t.Fatalf("Connect = %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -311,4 +312,11 @@ func TestSSLKeyLogFile(t *testing.T) {
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Errorf("key log mode = %v, want 0600: it is a secret", info.Mode().Perm())
 	}
+}
+
+// conninfo quotes a path as a key=value connection string has it: a
+// backslash, such as Windows separates directories with, escapes the
+// character after it, as in libpq.
+func conninfo(path string) string {
+	return "'" + strings.ReplaceAll(strings.ReplaceAll(path, `\`, `\\`), "'", `\'`) + "'"
 }
