@@ -172,7 +172,7 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	auth := authenticator{conn: c, policy: policy}
+	auth := authenticator{ctx: ctx, conn: c, policy: policy}
 	asked := c.protocol
 	for i := range maxLoginMessages {
 		kind, body, err := c.Receive()
@@ -378,6 +378,7 @@ func (c *Conn) startupMessage() []byte {
 // authenticator answers the server's authentication requests, within what
 // require_auth and channel_binding allow.
 type authenticator struct {
+	ctx      context.Context
 	conn     *Conn
 	scram    *scramClient
 	gss      GSS
@@ -387,6 +388,8 @@ type authenticator struct {
 	// connection.
 	asked bool
 	bound bool
+	// oauth is an OAUTHBEARER exchange begun.
+	oauth bool
 }
 
 // requireBinding reports whether channel_binding is require.
@@ -449,11 +452,7 @@ func (a *authenticator) handle(body []byte) error {
 		}
 		return a.send(AppendString(nil, md5Response(a.conn.config.User, a.conn.config.Password, data)))
 	case authSASL:
-		a.asked = true
-		if err := a.policy.check("scram-sha-256"); err != nil {
-			return err
-		}
-		return a.beginSCRAM(data)
+		return a.beginSASL(data)
 	case authGSS:
 		return a.beginGSS("gss")
 	case authSSPI:
@@ -461,7 +460,7 @@ func (a *authenticator) handle(body []byte) error {
 	case authGSSContinue:
 		return a.continueGSS(data)
 	case authSASLContinue:
-		return a.continueSCRAM(data)
+		return a.continueSASL(data)
 	case authSASLFinal:
 		return a.finishSCRAM(data)
 	}
@@ -482,6 +481,27 @@ func (a *authenticator) send(body []byte) error {
 	message, mark := StartMessage(nil, 'p')
 	_, err := a.conn.netConn.Write(FinishMessage(append(message, body...), mark))
 	return err
+}
+
+// beginSASL begins SCRAM where the server offers it, and OAUTHBEARER where
+// that is all it offers.
+func (a *authenticator) beginSASL(mechanisms []byte) error {
+	if !offersSCRAM(mechanisms) && offersMechanism(mechanisms, oauthMechanism) {
+		return a.beginOAuth()
+	}
+	a.asked = true
+	if err := a.policy.check("scram-sha-256"); err != nil {
+		return err
+	}
+	return a.beginSCRAM(mechanisms)
+}
+
+// continueSASL is the server's next step in whichever exchange is begun.
+func (a *authenticator) continueSASL(data []byte) error {
+	if a.oauth {
+		return a.refusedOAuth(data)
+	}
+	return a.continueSCRAM(data)
 }
 
 // beginSCRAM begins SCRAM with the mechanism scramMechanisms picks.

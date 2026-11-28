@@ -54,6 +54,7 @@ var connectionKeys = map[string]bool{
 	"min_protocol_version": true, "max_protocol_version": true,
 	"require_auth": true, "channel_binding": true, "sslnegotiation": true,
 	"service": true, "servicefile": true,
+	"oauth_issuer": true, "oauth_client_id": true, "oauth_client_secret": true, "oauth_scope": true,
 	"krbsrvname": true, "krbspn": true, "gsslib": true, "gssencmode": true, "gssdelegation": true,
 	"keepalives": true, "keepalives_idle": true, "keepalives_interval": true, "keepalives_count": true,
 	"tcp_user_timeout": true, "load_balance_hosts": true, "requirepeer": true,
@@ -205,6 +206,8 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	}
 	config.RequireAuth, config.ChannelBinding = settings["require_auth"], settings["channel_binding"]
 	config.KerberosServiceName, config.KerberosSPN = settings["krbsrvname"], settings["krbspn"]
+	config.OAuthIssuer, config.OAuthClientID = settings["oauth_issuer"], settings["oauth_client_id"]
+	config.OAuthClientSecret, config.OAuthScope = settings["oauth_client_secret"], settings["oauth_scope"]
 	if settings["gssencmode"] == "require" {
 		return nil, fmt.Errorf("%w: gssencmode=require: GSSAPI encryption is not supported; use TLS, with Kerberos to log in", ErrInvalidConnString)
 	}

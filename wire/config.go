@@ -93,6 +93,21 @@ type Config struct {
 	KerberosServiceName string
 	KerberosSPN         string
 
+	// OAuthToken gets the bearer token a server that asks for OAuth
+	// (OAUTHBEARER, PostgreSQL 18) is logged in with, asked with the
+	// connection's OAuth settings. Nil refuses such a login with ErrOAuth.
+	// Getting a token, by a device flow or a client credentials grant, and
+	// caching it, is the program's: libpq does it with libcurl and a
+	// terminal, neither of which a library has.
+	OAuthToken func(ctx context.Context, request OAuthRequest) (string, error)
+	// OAuthIssuer, OAuthClientID, OAuthClientSecret and OAuthScope are
+	// libpq's oauth_issuer, oauth_client_id, oauth_client_secret and
+	// oauth_scope, handed to OAuthToken.
+	OAuthIssuer       string
+	OAuthClientID     string
+	OAuthClientSecret string
+	OAuthScope        string
+
 	// ConnectTimeout bounds dialling and logging in when the caller's context
 	// has no earlier deadline. Zero means only the context bounds it.
 	ConnectTimeout time.Duration

@@ -34,6 +34,10 @@ var (
 	// connection whose Config.NewGSS is nil.
 	ErrNoGSS = errors.New("caduceus/wire: the server asked for Kerberos (GSSAPI) and Config.NewGSS is nil: set it, to gss.New from github.com/gsoultan/caduceus/gss for one")
 
+	// ErrOAuth is a login with OAuth (OAUTHBEARER, PostgreSQL 18) that
+	// failed on the client's side, or whose token the server refused.
+	ErrOAuth = errors.New("caduceus/wire: OAuth login failed")
+
 	// ErrSCRAM is returned when the server does not hold up its half of
 	// SCRAM-SHA-256. It says no more than that: the detail would be about a secret.
 	ErrSCRAM = errors.New("caduceus/wire: server failed SCRAM authentication")
