@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"time"
 )
@@ -53,7 +54,7 @@ func Connect(ctx context.Context, config *Config) (*Conn, error) {
 		return nil, err
 	}
 	a := attempt{config: config}
-	for _, server := range config.servers() {
+	for _, server := range ordered(config, config.servers()) {
 		if a.server(ctx, server) {
 			break
 		}
@@ -103,7 +104,7 @@ func dial(ctx context.Context, config *Config, version ProtocolVersion) (*Conn, 
 // plaintext would be refused the same, or worse, let through unbound.
 func fallbackWorthy(err error) bool {
 	var serverErr *Error
-	refused := errors.Is(err, ErrRequireAuth) || errors.Is(err, ErrChannelBinding)
+	refused := errors.Is(err, ErrRequireAuth) || errors.Is(err, ErrChannelBinding) || errors.Is(err, ErrSSLCertMode) || errors.Is(err, ErrRevoked) || errors.Is(err, ErrRequirePeer)
 	return !errors.As(err, &serverErr) && ctxErr(err) == nil && !refused
 }
 
@@ -118,6 +119,10 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version
 	network, address := config.target()
 	netConn, err := config.dialer()(ctx, network, address)
 	if err != nil {
+		return nil, err
+	}
+	if err := config.peer(network, netConn); err != nil {
+		_ = netConn.Close()
 		return nil, err
 	}
 
@@ -248,13 +253,63 @@ func (c *Conn) cancelKey(body []byte) bool {
 // secure starts TLS, if it is to be used: at once with DirectTLS, or once
 // the server has agreed to it.
 func (c *Conn) secure(ctx context.Context, tlsConfig *tls.Config) error {
-	switch {
-	case tlsConfig == nil:
+	if tlsConfig == nil {
 		return nil
-	case c.config.DirectTLS:
-		return c.directTLS(ctx, tlsConfig)
 	}
-	return c.negotiateTLS(ctx, tlsConfig)
+	tlsConfig, asked := c.certificateWatch(tlsConfig)
+	tlsConfig, keyLog, err := c.keyLog(tlsConfig)
+	if err != nil {
+		return err
+	}
+	if keyLog != nil {
+		defer keyLog.Close()
+	}
+	if c.config.DirectTLS {
+		err = c.directTLS(ctx, tlsConfig)
+	} else {
+		err = c.negotiateTLS(ctx, tlsConfig)
+	}
+	if err == nil && asked != nil && !*asked {
+		return ErrSSLCertMode
+	}
+	return err
+}
+
+// keyLog is tlsConfig writing its session keys to SSLKeyLogFile, and the
+// file, which is closed once the handshake is over: every key TLS logs, it
+// logs during the handshake. It is opened here, for each connection, rather
+// than when the connection string is read, which opens nothing.
+func (c *Conn) keyLog(tlsConfig *tls.Config) (*tls.Config, *os.File, error) {
+	if c.config.SSLKeyLogFile == "" {
+		return tlsConfig, nil, nil
+	}
+	file, err := os.OpenFile(c.config.SSLKeyLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("caduceus/wire: opening sslkeylogfile: %w", err)
+	}
+	logged := tlsConfig.Clone()
+	logged.KeyLogWriter = file
+	return logged, file, nil
+}
+
+// certificateWatch is tlsConfig, made for RequireClientCert to note whether
+// the server asks for a certificate, and where it notes it; or tlsConfig
+// itself and nil.
+func (c *Conn) certificateWatch(tlsConfig *tls.Config) (*tls.Config, *bool) {
+	if !c.config.RequireClientCert {
+		return tlsConfig, nil
+	}
+	watched := tlsConfig.Clone()
+	asked := new(bool)
+	certificates := watched.Certificates
+	watched.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		*asked = true
+		if len(certificates) == 0 {
+			return &tls.Certificate{}, nil
+		}
+		return &certificates[0], nil
+	}
+	return watched, asked
 }
 
 // directTLS starts TLS at once, with the ALPN protocol postgresql, by which

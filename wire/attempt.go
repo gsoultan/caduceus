@@ -22,7 +22,7 @@ type attempt struct {
 // reports whether to stop: a connection was chosen, or it failed in a way no
 // other server could do better than.
 func (a *attempt) server(ctx context.Context, server FallbackConfig) bool {
-	addresses, err := a.addresses(ctx, server.Host)
+	addresses, err := a.addresses(ctx, server)
 	if err != nil {
 		a.fail(a.config.at(server), err)
 		return ctx.Err() != nil
@@ -36,13 +36,18 @@ func (a *attempt) server(ctx context.Context, server FallbackConfig) bool {
 	return false
 }
 
-// addresses is what LookupFunc makes of host: the host itself without one,
-// and for a socket directory.
-func (a *attempt) addresses(ctx context.Context, host string) ([]string, error) {
-	if a.config.LookupFunc == nil || (&Config{Host: host}).unix() {
-		return []string{host}, nil
+// addresses is what LookupFunc makes of the server's host: the host itself
+// without one, for a socket directory, and where hostaddr gives the address.
+//
+// With LoadBalanceHosts they are shuffled, and a host is looked up here even
+// without LookupFunc, so that its addresses are shuffled too.
+func (a *attempt) addresses(ctx context.Context, server FallbackConfig) ([]string, error) {
+	lookup := a.config.lookup()
+	if lookup == nil || server.HostAddr != "" || (&Config{Host: server.Host}).unix() {
+		return []string{server.Host}, nil
 	}
-	return a.config.LookupFunc(ctx, host)
+	addresses, err := lookup(ctx, server.Host)
+	return ordered(a.config, addresses), err
 }
 
 // address connects to the server one names and asks ValidateConnect of it,

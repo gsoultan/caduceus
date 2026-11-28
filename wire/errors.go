@@ -59,6 +59,19 @@ var (
 	// SCRAM. Nothing of the password has been sent.
 	ErrChannelBinding = errors.New("caduceus/wire: channel binding is required and not to be had")
 
+	// ErrRequirePeer is returned when requirepeer names a user and the server
+	// at the other end of the Unix socket runs as another, or the system
+	// cannot say who it runs as.
+	ErrRequirePeer = errors.New("caduceus/wire: the server's process does not run as the user requirepeer names")
+
+	// ErrSSLCertMode is returned when sslcertmode=require and the server did
+	// not ask for a client certificate.
+	ErrSSLCertMode = errors.New("caduceus/wire: sslcertmode=require and the server did not ask for a client certificate")
+
+	// ErrRevoked is returned when a certificate the server presents is on a
+	// revocation list sslcrl or sslcrldir names.
+	ErrRevoked = errors.New("caduceus/wire: the server's certificate has been revoked")
+
 	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
 	// string, because the string is where the password is.
 	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")

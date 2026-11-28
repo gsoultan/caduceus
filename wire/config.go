@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -26,6 +27,10 @@ type Config struct {
 	// (any value starting with a slash).
 	Host string
 	Port uint16
+	// HostAddr is libpq's hostaddr: the numeric address to dial instead of
+	// looking Host up. Host is still the name TLS checks the certificate
+	// against and the password file is searched by.
+	HostAddr string
 
 	User     string
 	Password string
@@ -41,6 +46,18 @@ type Config struct {
 	// TLSFallback allows a plaintext connection when the server declines TLS or
 	// the handshake fails: libpq's sslmode=prefer, the default.
 	TLSFallback bool
+
+	// RequireClientCert is libpq's sslcertmode=require: the server must ask
+	// for a client certificate during the TLS handshake, which shows it
+	// checks one, or the connection fails with ErrSSLCertMode.
+	// sslcertmode=disable leaves the certificate out of TLSConfig instead.
+	RequireClientCert bool
+
+	// SSLKeyLogFile is libpq's sslkeylogfile: a file each TLS connection
+	// appends its session keys to, in the NSS key log format Wireshark reads,
+	// for debugging. It is a secret: with it, anyone holding a capture of the
+	// traffic can read it. The file is created with mode 0600.
+	SSLKeyLogFile string
 
 	// DirectTLS starts TLS as soon as the connection is open, with the ALPN
 	// protocol postgresql, rather than asking for it first: libpq's
@@ -126,8 +143,30 @@ type Config struct {
 	// ConnectTimeout bounds each server on its own, as libpq's does.
 	Fallbacks []*FallbackConfig
 
+	// KeepAlive configures TCP keepalives on a connection the default dialer
+	// opens: libpq's keepalives, keepalives_idle, keepalives_interval and
+	// keepalives_count. Nil probes an idle connection every five minutes; one
+	// with Enable false sends no probes.
+	KeepAlive *net.KeepAliveConfig
+	// TCPUserTimeout is libpq's tcp_user_timeout: how long data may go
+	// unacknowledged before the kernel drops the connection, on Linux, where
+	// the default dialer sets it. Zero leaves the system's default.
+	TCPUserTimeout time.Duration
+
+	// LoadBalanceHosts is libpq's load_balance_hosts=random: the servers, and
+	// the addresses LookupFunc gives for each, are tried in a random order
+	// rather than as listed, which spreads clients over them.
+	LoadBalanceHosts bool
+
+	// RequirePeer is libpq's requirepeer: on a Unix socket, the operating
+	// system user the server process must run as, which the kernel reports.
+	// A server running as another is refused with ErrRequirePeer before the
+	// password is sent. It is supported on Linux.
+	RequirePeer string
+
 	// DialFunc opens the network connection; nil dials with a net.Dialer
-	// that keeps the connection alive every five minutes. LookupFunc, if set,
+	// that keeps the connection alive every five minutes, or as KeepAlive and
+	// TCPUserTimeout say. LookupFunc, if set,
 	// resolves a host to the addresses to try, in order, each as a server of
 	// its own; nil leaves that to the dialer, which tries every address of a
 	// host and reports the first that answers.
@@ -152,6 +191,10 @@ type Config struct {
 func (c *Config) Copy() *Config {
 	clone := *c
 	clone.RuntimeParams = maps.Clone(c.RuntimeParams)
+	if c.KeepAlive != nil {
+		keepAlive := *c.KeepAlive
+		clone.KeepAlive = &keepAlive
+	}
 	if c.TLSConfig != nil {
 		clone.TLSConfig = c.TLSConfig.Clone()
 	}
@@ -185,7 +228,7 @@ func (c *Config) validAuth() error {
 // servers is where to connect, in order: Host and Port, then each fallback.
 func (c *Config) servers() []FallbackConfig {
 	servers := make([]FallbackConfig, 0, 1+len(c.Fallbacks))
-	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
+	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, HostAddr: c.HostAddr, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
 	for _, fallback := range c.Fallbacks {
 		servers = append(servers, *fallback)
 	}
@@ -198,7 +241,7 @@ func (c *Config) servers() []FallbackConfig {
 // request, is the server it is connected to.
 func (c *Config) at(server FallbackConfig) *Config {
 	one := *c
-	one.Host, one.Port = server.Host, server.Port
+	one.Host, one.Port, one.HostAddr = server.Host, server.Port, server.HostAddr
 	one.TLSConfig, one.TLSFallback = server.TLSConfig, server.TLSFallback
 	one.Fallbacks = nil
 	return &one
@@ -209,7 +252,41 @@ func (c *Config) dialer() func(ctx context.Context, network, address string) (ne
 	if c.DialFunc != nil {
 		return c.DialFunc
 	}
-	return (&net.Dialer{KeepAlive: 5 * time.Minute}).DialContext
+	dialer := &net.Dialer{KeepAlive: 5 * time.Minute, Control: tcpUserTimeout(c.TCPUserTimeout)}
+	if c.KeepAlive != nil {
+		dialer.KeepAliveConfig = *c.KeepAlive
+		dialer.KeepAlive = -1
+		if c.KeepAlive.Enable {
+			dialer.KeepAlive = 0
+		}
+	}
+	return dialer.DialContext
+}
+
+// lookup is LookupFunc, or, to shuffle a host's addresses for
+// LoadBalanceHosts, the system resolver; nil leaves resolving to the dialer.
+func (c *Config) lookup() func(ctx context.Context, host string) ([]string, error) {
+	if c.LookupFunc != nil || !c.LoadBalanceHosts {
+		return c.LookupFunc
+	}
+	return net.DefaultResolver.LookupHost
+}
+
+// ordered is list in the order to try it: as given, or shuffled for
+// LoadBalanceHosts.
+func ordered[T any](c *Config, list []T) []T {
+	if c.LoadBalanceHosts {
+		rand.Shuffle(len(list), func(i, j int) { list[i], list[j] = list[j], list[i] })
+	}
+	return list
+}
+
+// peer checks RequirePeer, which applies to a Unix socket only.
+func (c *Config) peer(network string, conn net.Conn) error {
+	if c.RequirePeer == "" || network != "unix" {
+		return nil
+	}
+	return checkPeer(conn, c.RequirePeer)
 }
 
 // minProtocol is the oldest protocol version a connection may use.
@@ -230,12 +307,15 @@ func (c *Config) firstProtocol() ProtocolVersion {
 
 // unix reports whether Host names a socket directory.
 func (c *Config) unix() bool {
-	return strings.HasPrefix(c.Host, "/")
+	return c.HostAddr == "" && strings.HasPrefix(c.Host, "/")
 }
 
 // target returns the network and address to dial.
 func (c *Config) target() (string, string) {
 	port := strconv.Itoa(int(c.Port))
+	if c.HostAddr != "" {
+		return "tcp", net.JoinHostPort(c.HostAddr, port)
+	}
 	if c.unix() {
 		return "unix", c.Host + "/.s.PGSQL." + port
 	}
