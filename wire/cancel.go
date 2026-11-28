@@ -6,16 +6,16 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"net"
 )
 
 // CancelRequest asks the server to cancel whatever this connection is running.
 // The protocol wants it on a separate connection, which the server closes
 // without answering; whether anything was cancelled is only visible on this one,
-// as SQLSTATE 57014. Safe from any goroutine.
+// as SQLSTATE 57014. It dials as the connection did, through DialFunc where
+// that is set. Safe from any goroutine.
 func (c *Conn) CancelRequest(ctx context.Context) error {
 	network, address := c.config.target()
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	conn, err := c.config.dialer()(ctx, network, address)
 	if err != nil {
 		return err
 	}
