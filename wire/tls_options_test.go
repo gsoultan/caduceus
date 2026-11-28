@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -309,7 +310,9 @@ func TestSSLKeyLogFile(t *testing.T) {
 	if err != nil || len(data) == 0 {
 		t.Fatalf("key log = %q, %v; want the session's keys", data, err)
 	}
-	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits: Go reports any file it can write
+	// as 0666 there, and access goes by the directory's ACL.
+	if info, _ := os.Stat(path); runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("key log mode = %v, want 0600: it is a secret", info.Mode().Perm())
 	}
 }
