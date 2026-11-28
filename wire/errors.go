@@ -62,4 +62,17 @@ var (
 	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
 	// string, because the string is where the password is.
 	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")
+
+	// ErrRequirePeer is returned when the process at the other end of a Unix
+	// socket is not running as the user requirepeer names, or its user
+	// cannot be learned on this system.
+	ErrRequirePeer = errors.New("caduceus/wire: the server is not running as the user requirepeer names")
+
+	// ErrSSLCertMode is returned when sslcertmode=require and the server did
+	// not ask for a client certificate.
+	ErrSSLCertMode = errors.New("caduceus/wire: sslcertmode=require and the server did not ask for a client certificate")
+
+	// ErrRevoked is returned when a certificate the server presents is listed
+	// in a revocation list sslcrl or sslcrldir names.
+	ErrRevoked = errors.New("caduceus/wire: the server's certificate is revoked")
 )

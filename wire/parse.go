@@ -54,6 +54,23 @@ var connectionKeys = map[string]bool{
 	"require_auth": true, "channel_binding": true, "sslnegotiation": true,
 	"service": true, "servicefile": true,
 	"krbsrvname": true, "krbspn": true, "gsslib": true, "gssencmode": true, "gssdelegation": true,
+	"keepalives": true, "keepalives_idle": true, "keepalives_interval": true, "keepalives_count": true,
+	"tcp_user_timeout": true, "load_balance_hosts": true, "requirepeer": true,
+	"fallback_application_name": true, "requiressl": true,
+	"sslcrl": true, "sslcrldir": true, "sslcompression": true, "sslcertmode": true, "sslkeylogfile": true,
+	"ssl_min_protocol_version": true, "ssl_max_protocol_version": true,
+}
+
+// unsupportedKeys are libpq's for what caduceus does not do. Each is refused
+// by name rather than sent on, where the server would refuse it as a setting
+// it does not know.
+var unsupportedKeys = map[string]string{
+	"oauth_issuer":        "OAuth login",
+	"oauth_client_id":     "OAuth login",
+	"oauth_client_secret": "OAuth login",
+	"oauth_scope":         "OAuth login",
+	"scram_client_key":    "a SCRAM login from stored keys",
+	"scram_server_key":    "a SCRAM login from stored keys",
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -77,6 +94,10 @@ var environment = [][2]string{
 	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
 	{"PGREQUIREAUTH", "require_auth"}, {"PGCHANNELBINDING", "channel_binding"},
 	{"PGSSLNEGOTIATION", "sslnegotiation"}, {"PGSSLSNI", "sslsni"},
+	{"PGSSLCRL", "sslcrl"}, {"PGSSLCRLDIR", "sslcrldir"}, {"PGSSLCERTMODE", "sslcertmode"},
+	{"PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"}, {"PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"},
+	{"PGREQUIREPEER", "requirepeer"}, {"PGLOADBALANCEHOSTS", "load_balance_hosts"},
+	{"PGTCPUSERTIMEOUT", "tcp_user_timeout"}, {"PGSSLKEYLOGFILE", "sslkeylogfile"},
 	{"PGKRBSRVNAME", "krbsrvname"}, {"PGGSSLIB", "gsslib"}, {"PGGSSENCMODE", "gssencmode"},
 }
 
@@ -174,6 +195,14 @@ func addEnvironment(settings map[string]string) {
 }
 
 func buildConfig(settings map[string]string) (*Config, error) {
+	for key, what := range unsupportedKeys {
+		if _, set := settings[key]; set {
+			return nil, fmt.Errorf("%w: %s: %s is not supported", ErrInvalidConnString, key, what)
+		}
+	}
+	if settings["requiressl"] == "1" && settings["sslmode"] == "" {
+		settings["sslmode"] = "require"
+	}
 	config := &Config{RuntimeParams: map[string]string{}}
 	if err := config.address(settings); err != nil {
 		return nil, err
@@ -190,6 +219,9 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	if err := config.sessionAttrs(settings["target_session_attrs"]); err != nil {
 		return nil, err
 	}
+	if err := config.socket(settings); err != nil {
+		return nil, err
+	}
 	config.RequireAuth, config.ChannelBinding = settings["require_auth"], settings["channel_binding"]
 	config.KerberosServiceName, config.KerberosSPN = settings["krbsrvname"], settings["krbspn"]
 	if settings["gssencmode"] == "require" {
@@ -202,6 +234,9 @@ func buildConfig(settings map[string]string) (*Config, error) {
 		if !connectionKeys[key] && !clientOnlyKeys[key] {
 			config.RuntimeParams[key] = value
 		}
+	}
+	if name := settings["fallback_application_name"]; name != "" && settings["application_name"] == "" {
+		config.RuntimeParams["application_name"] = name
 	}
 	if err := config.encryption(settings); err != nil {
 		return nil, err
@@ -399,6 +434,12 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	}
 
 	config := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+	if err := tlsVersions(config, settings); err != nil {
+		return nil, false, err
+	}
+	if err := keyLog(config, settings["sslkeylogfile"]); err != nil {
+		return nil, false, err
+	}
 	if settings["sslsni"] == "0" {
 		config.ServerName = ""
 	}
@@ -419,11 +460,19 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	if err := loadRoots(config, rootFile); err != nil {
 		return nil, false, err
 	}
-	if !config.InsecureSkipVerify && mode != "verify-full" {
+	verifies := !config.InsecureSkipVerify
+	if verifies && mode != "verify-full" {
 		verifyChainOnly(config)
 	}
-	if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"], settings["sslpassword"]); err != nil {
-		return nil, false, err
+	if verifies {
+		if err := addRevocation(config, settings["sslcrl"], settings["sslcrldir"], rootFile); err != nil {
+			return nil, false, err
+		}
+	}
+	if settings["sslcertmode"] != "disable" {
+		if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"], settings["sslpassword"]); err != nil {
+			return nil, false, err
+		}
 	}
 	return config, fallback, nil
 }

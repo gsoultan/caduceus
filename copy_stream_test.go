@@ -56,7 +56,7 @@ func messages(t *testing.T, buf []byte) []string {
 }
 
 func streamOf(oids ...uint32) *copyStream {
-	stream := &copyStream{target: "t (a, b)", oids: oids, binary: binaryColumns(oids)}
+	stream := &copyStream{target: "t (a, b)", oids: oids, binary: true}
 	stream.begin()
 	return stream
 }
@@ -126,11 +126,70 @@ func TestCopyStreamEmptySource(t *testing.T) {
 	if !bytes.Contains(stream.buf, []byte(copySignature+"\xff\xff")) {
 		t.Fatalf("an empty binary COPY should be its header and trailer, got %q", stream.buf)
 	}
-	text := streamOf(codec.Numeric)
-	encodeAll(t, text)
-	if got, want := strings.Join(messages(t, text.buf), " | "), "Q COPY t (a, b) FROM STDIN | c"; got != want {
-		t.Fatalf("empty text stream sent %q, want %q", got, want)
+	// With no row to say otherwise, a column codec cannot write in binary
+	// still gets the binary header: an empty binary COPY is as valid as an
+	// empty text one.
+	numeric := streamOf(codec.Numeric)
+	encodeAll(t, numeric)
+	if got, want := strings.Join(messages(t, numeric.buf), " | "), "Q COPY t (a, b) FROM STDIN (FORMAT binary) | d | c"; got != want {
+		t.Fatalf("empty stream sent %q, want %q", got, want)
 	}
+}
+
+// A BinaryParam writes itself in binary for a type codec has no encoder for,
+// and it has no text form, so the stream must not decide on text from the
+// column types alone.
+func TestCopyStreamStaysBinaryForABinaryParam(t *testing.T) {
+	const tstzrange = 3910
+	stream := streamOf(tstzrange)
+	encodeAll(t, stream, []any{rawParam{1}}, []any{nil})
+	got := strings.Join(messages(t, stream.buf), " | ")
+	if want := "Q COPY t (a, b) FROM STDIN (FORMAT binary) | d | c"; got != want {
+		t.Fatalf("stream sent %q\nwant %q", got, want)
+	}
+}
+
+// A first row that cannot be written in binary turns the stream to text
+// before anything went out: one COPY, in text.
+func TestCopyStreamStartsInTextWhenTheFirstRowNeedsIt(t *testing.T) {
+	stream := streamOf(codec.Numeric)
+	encodeAll(t, stream, []any{"1.5"}, []any{"2"})
+	got := strings.Join(messages(t, stream.buf), " | ")
+	if want := "Q COPY t (a, b) FROM STDIN | d | c"; got != want {
+		t.Fatalf("stream sent %q\nwant %q", got, want)
+	}
+	if !bytes.Contains(stream.buf, []byte("1.5\n2\n")) {
+		t.Fatalf("text rows missing from %q", stream.buf)
+	}
+}
+
+// A row whose other column has no binary form turns the stream to text, and a
+// BinaryParam that is a TextMarshaler too is written there as its text.
+func TestCopyStreamWritesABinaryParamInText(t *testing.T) {
+	const tstzrange, inet = 3910, 869
+	stream := streamOf(tstzrange, inet)
+	encodeAll(t, stream, []any{textParam{rawParam{1}, "[1,2)"}, "10.0.0.1"})
+	if got, want := strings.Join(messages(t, stream.buf), " | "), "Q COPY t (a, b) FROM STDIN | d | c"; got != want {
+		t.Fatalf("stream sent %q\nwant %q", got, want)
+	}
+	if !bytes.Contains(stream.buf, []byte("[1,2)\t10.0.0.1\n")) {
+		t.Fatalf("text row missing from %q", stream.buf)
+	}
+}
+
+// textParam is a rawParam with a text form.
+type textParam struct {
+	rawParam
+	text string
+}
+
+func (p textParam) MarshalText() ([]byte, error) { return []byte(p.text), nil }
+
+// rawParam is a BinaryParam that writes one byte.
+type rawParam struct{ b byte }
+
+func (p rawParam) AppendBinaryParam(dst []byte, _ uint32) ([]byte, bool, error) {
+	return append(dst, p.b), false, nil
 }
 
 // Every statement sent is answered with a ReadyForQuery, and reading one too
