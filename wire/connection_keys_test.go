@@ -179,15 +179,15 @@ func accepted(err error) bool {
 func TestRevocationList(t *testing.T) {
 	p := newPKI(t)
 	host, port := refusingTLSServer(t, &tls.Config{Certificates: []tls.Certificate{p.server}})
-	base := "host=" + host + " port=" + port + " user=u connect_timeout=5 sslsni=0 sslrootcert=" + p.root
+	base := "host=" + host + " port=" + port + " user=u connect_timeout=5 sslsni=0 sslrootcert=" + conninfo(p.root)
 	for _, tc := range []struct {
 		settings string
 		revoked  bool
 	}{
 		{" sslmode=verify-ca", false},
-		{" sslmode=verify-ca sslcrl=" + p.crl, true},
-		{" sslmode=verify-ca sslcrldir=" + filepath.Dir(p.crl), true},
-		{" sslmode=require sslrootcert='' sslcrl=" + p.crl, false},
+		{" sslmode=verify-ca sslcrl=" + conninfo(p.crl), true},
+		{" sslmode=verify-ca sslcrldir=" + conninfo(filepath.Dir(p.crl)), true},
+		{" sslmode=require sslrootcert='' sslcrl=" + conninfo(p.crl), false},
 	} {
 		config, err := ParseConfig(base + tc.settings)
 		if err != nil {
@@ -201,7 +201,7 @@ func TestRevocationList(t *testing.T) {
 			t.Errorf("%s: err = %v, want the handshake accepted", tc.settings, err)
 		}
 	}
-	if _, err := ParseConfig(base + " sslmode=verify-ca sslcrl=" + p.root); !errors.Is(err, ErrInvalidConnString) {
+	if _, err := ParseConfig(base + " sslmode=verify-ca sslcrl=" + conninfo(p.root)); !errors.Is(err, ErrInvalidConnString) {
 		t.Errorf("a file with no list in it: err = %v", err)
 	}
 }
