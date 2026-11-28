@@ -208,8 +208,8 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	config.KerberosServiceName, config.KerberosSPN = settings["krbsrvname"], settings["krbspn"]
 	config.OAuthIssuer, config.OAuthClientID = settings["oauth_issuer"], settings["oauth_client_id"]
 	config.OAuthClientSecret, config.OAuthScope = settings["oauth_client_secret"], settings["oauth_scope"]
-	if settings["gssencmode"] == "require" {
-		return nil, fmt.Errorf("%w: gssencmode=require: GSSAPI encryption is not supported; use TLS, with Kerberos to log in", ErrInvalidConnString)
+	if err := config.gssEncMode(settings["gssencmode"]); err != nil {
+		return nil, err
 	}
 	if err := config.validAuth(); err != nil {
 		return nil, err

@@ -3,7 +3,6 @@
 package wire
 
 import (
-	"crypto/tls"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -137,7 +136,7 @@ func (w *watermark) socket(c *Conn) syscall.RawConn {
 	// The mark is for TCP: over a Unix socket a long result is a copy in
 	// memory, with nothing to coalesce.
 	conn := c.netConn
-	if wrapped, ok := conn.(*tls.Conn); ok {
+	if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
 		conn = wrapped.NetConn()
 	}
 	if _, ok := conn.(*net.TCPConn); ok {

@@ -161,6 +161,13 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version
 }
 
 func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
+	encrypted, err := c.encryptGSS()
+	if err != nil {
+		return err
+	}
+	if encrypted {
+		tlsConfig = nil
+	}
 	if err := c.secure(ctx, tlsConfig); err != nil {
 		return err
 	}
@@ -172,7 +179,7 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	auth := authenticator{ctx: ctx, conn: c, policy: policy}
+	auth := authenticator{ctx: ctx, conn: c, policy: policy, gssEncrypted: encrypted}
 	asked := c.protocol
 	for i := range maxLoginMessages {
 		kind, body, err := c.Receive()
@@ -390,6 +397,9 @@ type authenticator struct {
 	bound bool
 	// oauth is an OAUTHBEARER exchange begun.
 	oauth bool
+	// gssEncrypted is a connection encrypted with GSSAPI, whose context
+	// the server takes as the login: it asks for nothing, and that is gss.
+	gssEncrypted bool
 }
 
 // requireBinding reports whether channel_binding is require.
@@ -420,7 +430,7 @@ func (a *authenticator) method(method string) error {
 // asked for nothing must be allowed to, and a binding required was made.
 func (a *authenticator) authenticated() error {
 	if !a.asked {
-		if err := a.policy.check("none"); err != nil {
+		if err := a.policy.check(a.silentMethod()); err != nil {
 			return err
 		}
 	}
@@ -428,6 +438,15 @@ func (a *authenticator) authenticated() error {
 		return ErrChannelBinding
 	}
 	return nil
+}
+
+// silentMethod is what a login that asked for nothing was: gss, over a
+// connection whose GSSAPI encryption authenticated it, and none otherwise.
+func (a *authenticator) silentMethod() string {
+	if a.gssEncrypted {
+		return "gss"
+	}
+	return "none"
 }
 
 func (a *authenticator) handle(body []byte) error {

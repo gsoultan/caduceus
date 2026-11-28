@@ -92,6 +92,14 @@ type Config struct {
 	// principal is not service/host.
 	KerberosServiceName string
 	KerberosSPN         string
+	// GSSEncMode is libpq's gssencmode: disable (or empty) does not
+	// encrypt with GSSAPI; prefer encrypts with it, in place of TLS, where
+	// NewGSS gives a provider that can (a GSSWrapper) and has credentials,
+	// and the server agrees; require refuses a connection that is not
+	// encrypted so, with ErrGSSEncRefused. libpq prefers by default where
+	// it finds credentials; caduceus asks to be told. A Unix socket is
+	// never encrypted.
+	GSSEncMode string
 
 	// OAuthToken gets the bearer token a server that asks for OAuth
 	// (OAUTHBEARER, PostgreSQL 18) is logged in with, asked with the
