@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gsoultan/caduceus"
@@ -87,5 +88,39 @@ func TestCachePath(t *testing.T) {
 	t.Setenv("KRB5CCNAME", "KEYRING:persistent:1000")
 	if _, err := cachePath(); err == nil {
 		t.Error("a KEYRING cache was taken for a file")
+	}
+}
+
+// gssencmode=require encrypts the connection with the Kerberos context in
+// place of TLS: the server says so, and results and parameters larger than
+// one of its packets cross it whole, in both directions.
+func TestLiveGSSEncryption(t *testing.T) {
+	config := liveConfig(t)
+	config.NewGSS = New
+	config.GSSEncMode = "require"
+	conn, err := caduceus.ConnectConfig(t.Context(), config, caduceus.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var encrypted, authenticated bool
+	if err := conn.QueryRow(t.Context(), "SELECT encrypted, gss_authenticated FROM pg_stat_gssapi WHERE pid = pg_backend_pid()").Scan(&encrypted, &authenticated); err != nil {
+		t.Fatal(err)
+	}
+	if !encrypted || !authenticated {
+		t.Fatalf("encrypted %v, GSSAPI authenticated %v", encrypted, authenticated)
+	}
+	sent := strings.Repeat("0123456789abcdef", 10000)
+	var echoed string
+	var length int
+	if err := conn.QueryRow(t.Context(), "SELECT $1::text, length(repeat('x', 300000))", sent).Scan(&echoed, &length); err != nil {
+		t.Fatal(err)
+	}
+	if echoed != sent || length != 300000 {
+		t.Errorf("echoed %d bytes of %d", len(echoed), len(sent))
+	}
+	var big string
+	if err := conn.QueryRow(t.Context(), "SELECT repeat('y', 300000)").Scan(&big); err != nil || len(big) != 300000 {
+		t.Fatalf("a 300 kB result: %d bytes, %v", len(big), err)
 	}
 }

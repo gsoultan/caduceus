@@ -37,9 +37,20 @@ type Kerberos struct {
 	key   types.EncryptionKey
 	ctime time.Time
 	cusec int
+	// The established context, for encryption: the key it protects
+	// messages with, the acceptor's subkey where the server sent one;
+	// whether it is that subkey; and the sequence numbers of the next
+	// message each way, the server's taken from its first where its reply
+	// did not say.
+	seal           types.EncryptionKey
+	acceptorSubkey bool
+	established    bool
+	sendSeq        uint64
+	recvSeq        uint64
+	recvSeqKnown   bool
 }
 
-var _ wire.GSS = (*Kerberos)(nil)
+var _ wire.GSSWrapper = (*Kerberos)(nil)
 
 // New starts a login from the credentials kinit left: the cache KRB5CCNAME
 // names, or /tmp/krb5cc_<uid>, with the configuration in KRB5_CONFIG or
@@ -128,7 +139,7 @@ func (k *Kerberos) GetInitTokenFromSPN(spn string) ([]byte, error) {
 		return nil, fmt.Errorf("caduceus/gss: getting a ticket for %s: %w", spn, err)
 	}
 	token, err := spnego.NewKRB5TokenAPREQ(k.client, ticket, key,
-		[]int{gssapi.ContextFlagInteg, gssapi.ContextFlagMutual},
+		[]int{gssapi.ContextFlagInteg, gssapi.ContextFlagConf, gssapi.ContextFlagMutual, gssapi.ContextFlagReplay, gssapi.ContextFlagSequence},
 		[]int{flags.APOptionMutualRequired})
 	if err != nil {
 		return nil, fmt.Errorf("caduceus/gss: %w", err)
@@ -151,6 +162,7 @@ func (k *Kerberos) remember(request messages.APReq, key types.EncryptionKey) err
 		return fmt.Errorf("caduceus/gss: %w", err)
 	}
 	k.key, k.ctime, k.cusec = key, authenticator.CTime, authenticator.Cusec
+	k.sendSeq = uint64(authenticator.SeqNumber)
 	return nil
 }
 
@@ -179,5 +191,6 @@ func (k *Kerberos) Continue(in []byte) (bool, []byte, error) {
 	if !part.CTime.Equal(k.ctime) || part.Cusec != k.cusec {
 		return false, nil, ErrMutual
 	}
+	k.establish(part)
 	return true, nil, nil
 }
