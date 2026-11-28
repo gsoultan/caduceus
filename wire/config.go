@@ -27,6 +27,10 @@ type Config struct {
 	// (any value starting with a slash).
 	Host string
 	Port uint16
+	// HostAddr is libpq's hostaddr: the numeric address to dial instead of
+	// looking Host up. Host is still the name TLS checks the certificate
+	// against and the password file is searched by.
+	HostAddr string
 
 	User     string
 	Password string
@@ -42,6 +46,12 @@ type Config struct {
 	// TLSFallback allows a plaintext connection when the server declines TLS or
 	// the handshake fails: libpq's sslmode=prefer, the default.
 	TLSFallback bool
+
+	// SSLKeyLogFile is libpq's sslkeylogfile: a file each TLS connection
+	// appends its session keys to, in the NSS key log format Wireshark reads,
+	// for debugging. It is a secret: with it, anyone holding a capture of the
+	// traffic can read it. The file is created with mode 0600.
+	SSLKeyLogFile string
 
 	// DirectTLS starts TLS as soon as the connection is open, with the ALPN
 	// protocol postgresql, rather than asking for it first: libpq's
@@ -76,6 +86,29 @@ type Config struct {
 	// principal is not service/host.
 	KerberosServiceName string
 	KerberosSPN         string
+	// GSSEncMode is libpq's gssencmode: disable (or empty) does not
+	// encrypt with GSSAPI; prefer encrypts with it, in place of TLS, where
+	// NewGSS gives a provider that can (a GSSWrapper) and has credentials,
+	// and the server agrees; require refuses a connection that is not
+	// encrypted so, with ErrGSSEncRefused. libpq prefers by default where
+	// it finds credentials; caduceus asks to be told. A Unix socket is
+	// never encrypted.
+	GSSEncMode string
+
+	// OAuthToken gets the bearer token a server that asks for OAuth
+	// (OAUTHBEARER, PostgreSQL 18) is logged in with, asked with the
+	// connection's OAuth settings. Nil refuses such a login with ErrOAuth.
+	// Getting a token, by a device flow or a client credentials grant, and
+	// caching it, is the program's: libpq does it with libcurl and a
+	// terminal, neither of which a library has.
+	OAuthToken func(ctx context.Context, request OAuthRequest) (string, error)
+	// OAuthIssuer, OAuthClientID, OAuthClientSecret and OAuthScope are
+	// libpq's oauth_issuer, oauth_client_id, oauth_client_secret and
+	// oauth_scope, handed to OAuthToken.
+	OAuthIssuer       string
+	OAuthClientID     string
+	OAuthClientSecret string
+	OAuthScope        string
 
 	// KeepAlive sets TCP keepalives on a connection DialFunc does not open:
 	// libpq's keepalives_idle, keepalives_interval and keepalives_count. A
@@ -90,8 +123,9 @@ type Config struct {
 	TCPUserTimeout time.Duration
 
 	// LoadBalanceHosts is libpq's load_balance_hosts=random: the servers,
-	// Host and Fallbacks alike, are tried in a random order on each Connect,
-	// which spreads connections across them.
+	// Host and Fallbacks alike, and the addresses each resolves to, are tried
+	// in a random order on each Connect, which spreads connections across
+	// them.
 	LoadBalanceHosts bool
 
 	// RequirePeer is libpq's requirepeer: over a Unix socket, the name of the
@@ -174,7 +208,8 @@ type Config struct {
 	Fallbacks []*FallbackConfig
 
 	// DialFunc opens the network connection; nil dials with a net.Dialer
-	// that keeps the connection alive every five minutes. LookupFunc, if set,
+	// that keeps the connection alive every five minutes, or as KeepAlive and
+	// TCPUserTimeout say. LookupFunc, if set,
 	// resolves a host to the addresses to try, in order, each as a server of
 	// its own; nil leaves that to the dialer, which tries every address of a
 	// host and reports the first that answers.
@@ -233,14 +268,11 @@ func (c *Config) validAuth() error {
 // or all of them shuffled when LoadBalanceHosts is set.
 func (c *Config) servers() []FallbackConfig {
 	servers := make([]FallbackConfig, 0, 1+len(c.Fallbacks))
-	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
+	servers = append(servers, FallbackConfig{Host: c.Host, Port: c.Port, HostAddr: c.HostAddr, TLSConfig: c.TLSConfig, TLSFallback: c.TLSFallback})
 	for _, fallback := range c.Fallbacks {
 		servers = append(servers, *fallback)
 	}
-	if c.LoadBalanceHosts {
-		rand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
-	}
-	return servers
+	return ordered(c, servers)
 }
 
 // at is the configuration of a connection to one server: this one, with that
@@ -249,7 +281,7 @@ func (c *Config) servers() []FallbackConfig {
 // request, is the server it is connected to.
 func (c *Config) at(server FallbackConfig) *Config {
 	one := *c
-	one.Host, one.Port = server.Host, server.Port
+	one.Host, one.Port, one.HostAddr = server.Host, server.Port, server.HostAddr
 	one.TLSConfig, one.TLSFallback = server.TLSConfig, server.TLSFallback
 	one.Fallbacks = nil
 	return &one
@@ -279,9 +311,35 @@ func (c *Config) netDialer() *net.Dialer {
 		dialer.KeepAliveConfig = keepAlive
 	}
 	if c.TCPUserTimeout > 0 {
-		dialer.Control = userTimeout(c.TCPUserTimeout)
+		dialer.Control = tcpUserTimeout(c.TCPUserTimeout)
 	}
 	return dialer
+}
+
+// lookup is LookupFunc, or, to shuffle a host's addresses for
+// LoadBalanceHosts, the system resolver; nil leaves resolving to the dialer.
+func (c *Config) lookup() func(ctx context.Context, host string) ([]string, error) {
+	if c.LookupFunc != nil || !c.LoadBalanceHosts {
+		return c.LookupFunc
+	}
+	return net.DefaultResolver.LookupHost
+}
+
+// ordered is list in the order to try it: as given, or shuffled for
+// LoadBalanceHosts.
+func ordered[T any](c *Config, list []T) []T {
+	if c.LoadBalanceHosts {
+		rand.Shuffle(len(list), func(i, j int) { list[i], list[j] = list[j], list[i] })
+	}
+	return list
+}
+
+// peer checks RequirePeer, which applies to a Unix socket only.
+func (c *Config) peer(network string, conn net.Conn) error {
+	if c.RequirePeer == "" || network != "unix" {
+		return nil
+	}
+	return checkPeer(conn, c.RequirePeer)
 }
 
 // minProtocol is the oldest protocol version a connection may use.
@@ -302,12 +360,15 @@ func (c *Config) firstProtocol() ProtocolVersion {
 
 // unix reports whether Host names a socket directory.
 func (c *Config) unix() bool {
-	return strings.HasPrefix(c.Host, "/")
+	return c.HostAddr == "" && strings.HasPrefix(c.Host, "/")
 }
 
 // target returns the network and address to dial.
 func (c *Config) target() (string, string) {
 	port := strconv.Itoa(int(c.Port))
+	if c.HostAddr != "" {
+		return "tcp", net.JoinHostPort(c.HostAddr, port)
+	}
 	if c.unix() {
 		return "unix", c.Host + "/.s.PGSQL." + port
 	}

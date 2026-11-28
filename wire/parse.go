@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/user"
@@ -53,6 +54,7 @@ var connectionKeys = map[string]bool{
 	"min_protocol_version": true, "max_protocol_version": true,
 	"require_auth": true, "channel_binding": true, "sslnegotiation": true,
 	"service": true, "servicefile": true,
+	"oauth_issuer": true, "oauth_client_id": true, "oauth_client_secret": true, "oauth_scope": true,
 	"krbsrvname": true, "krbspn": true, "gsslib": true, "gssencmode": true, "gssdelegation": true,
 	"keepalives": true, "keepalives_idle": true, "keepalives_interval": true, "keepalives_count": true,
 	"tcp_user_timeout": true, "load_balance_hosts": true, "requirepeer": true,
@@ -65,12 +67,8 @@ var connectionKeys = map[string]bool{
 // by name rather than sent on, where the server would refuse it as a setting
 // it does not know.
 var unsupportedKeys = map[string]string{
-	"oauth_issuer":        "OAuth login",
-	"oauth_client_id":     "OAuth login",
-	"oauth_client_secret": "OAuth login",
-	"oauth_scope":         "OAuth login",
-	"scram_client_key":    "a SCRAM login from stored keys",
-	"scram_server_key":    "a SCRAM login from stored keys",
+	"scram_client_key": "a SCRAM login from stored keys",
+	"scram_server_key": "a SCRAM login from stored keys",
 }
 
 // clientOnlyKeys are settings pgx read from a connection string. Passing them on
@@ -94,11 +92,15 @@ var environment = [][2]string{
 	{"PGMAXPROTOCOLVERSION", "max_protocol_version"},
 	{"PGREQUIREAUTH", "require_auth"}, {"PGCHANNELBINDING", "channel_binding"},
 	{"PGSSLNEGOTIATION", "sslnegotiation"}, {"PGSSLSNI", "sslsni"},
-	{"PGSSLCRL", "sslcrl"}, {"PGSSLCRLDIR", "sslcrldir"}, {"PGSSLCERTMODE", "sslcertmode"},
-	{"PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"}, {"PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"},
-	{"PGREQUIREPEER", "requirepeer"}, {"PGLOADBALANCEHOSTS", "load_balance_hosts"},
 	{"PGTCPUSERTIMEOUT", "tcp_user_timeout"}, {"PGSSLKEYLOGFILE", "sslkeylogfile"},
 	{"PGKRBSRVNAME", "krbsrvname"}, {"PGGSSLIB", "gsslib"}, {"PGGSSENCMODE", "gssencmode"},
+	{"PGHOSTADDR", "hostaddr"}, {"PGSSLCRL", "sslcrl"}, {"PGSSLCRLDIR", "sslcrldir"},
+	{"PGSSLCERTMODE", "sslcertmode"}, {"PGSSLCOMPRESSION", "sslcompression"},
+	{"PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"},
+	{"PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"},
+	{"PGREQUIREPEER", "requirepeer"}, {"PGLOADBALANCEHOSTS", "load_balance_hosts"},
+	{"PGOPTIONS", "options"}, {"PGCLIENTENCODING", "client_encoding"},
+	{"PGDATESTYLE", "datestyle"}, {"PGTZ", "timezone"}, {"PGGEQO", "geqo"},
 }
 
 func parseSettings(text string) (map[string]string, error) {
@@ -219,15 +221,17 @@ func buildConfig(settings map[string]string) (*Config, error) {
 	if err := config.sessionAttrs(settings["target_session_attrs"]); err != nil {
 		return nil, err
 	}
-	if err := config.socket(settings); err != nil {
-		return nil, err
-	}
 	config.RequireAuth, config.ChannelBinding = settings["require_auth"], settings["channel_binding"]
 	config.KerberosServiceName, config.KerberosSPN = settings["krbsrvname"], settings["krbspn"]
-	if settings["gssencmode"] == "require" {
-		return nil, fmt.Errorf("%w: gssencmode=require: GSSAPI encryption is not supported; use TLS, with Kerberos to log in", ErrInvalidConnString)
+	config.OAuthIssuer, config.OAuthClientID = settings["oauth_issuer"], settings["oauth_client_id"]
+	config.OAuthClientSecret, config.OAuthScope = settings["oauth_client_secret"], settings["oauth_scope"]
+	if err := config.gssEncMode(settings["gssencmode"]); err != nil {
+		return nil, err
 	}
 	if err := config.validAuth(); err != nil {
+		return nil, err
+	}
+	if err := config.transport(settings); err != nil {
 		return nil, err
 	}
 	for key, value := range settings {
@@ -250,6 +254,10 @@ func buildConfig(settings map[string]string) (*Config, error) {
 func (c *Config) address(settings map[string]string) error {
 	hosts := strings.Split(settings["host"], ",")
 	ports := strings.Split(settings["port"], ",")
+	addrs, err := hostAddrs(settings["hostaddr"], &hosts)
+	if err != nil {
+		return err
+	}
 	if len(ports) != 1 && len(ports) != len(hosts) {
 		return fmt.Errorf("%w: %d ports for %d hosts", ErrInvalidConnString, len(ports), len(hosts))
 	}
@@ -258,16 +266,50 @@ func (c *Config) address(settings map[string]string) error {
 		if err != nil {
 			return err
 		}
-		if host == "" {
-			host = defaultHost(port)
-		}
+		host = hostFor(host, addrs[i], port)
 		if i == 0 {
-			c.Host, c.Port = host, port
+			c.Host, c.Port, c.HostAddr = host, port, addrs[i]
 			continue
 		}
-		c.Fallbacks = append(c.Fallbacks, &FallbackConfig{Host: host, Port: port})
+		c.Fallbacks = append(c.Fallbacks, &FallbackConfig{Host: host, Port: port, HostAddr: addrs[i]})
 	}
 	return nil
+}
+
+// hostAddrs splits hostaddr, which must name as many addresses as host names
+// hosts, or stand in for host when host is not given; an empty entry dials
+// its host as usual. It returns an empty address for each host when hostaddr
+// is not given.
+func hostAddrs(text string, hosts *[]string) ([]string, error) {
+	if text == "" {
+		return make([]string, len(*hosts)), nil
+	}
+	addrs := strings.Split(text, ",")
+	if len(*hosts) == 1 && (*hosts)[0] == "" {
+		*hosts = make([]string, len(addrs))
+	}
+	if len(addrs) != len(*hosts) {
+		return nil, fmt.Errorf("%w: %d addresses in hostaddr for %d hosts", ErrInvalidConnString, len(addrs), len(*hosts))
+	}
+	for _, addr := range addrs {
+		if addr != "" && net.ParseIP(addr) == nil {
+			return nil, fmt.Errorf("%w: hostaddr %q is not a numeric IP address", ErrInvalidConnString, addr)
+		}
+	}
+	return addrs, nil
+}
+
+// hostFor is the host a server is known by: the one given, or, with none,
+// its hostaddr, which TLS then checks the certificate against, or else the
+// default.
+func hostFor(host, addr string, port uint16) string {
+	switch {
+	case host != "":
+		return host
+	case addr != "":
+		return addr
+	}
+	return defaultHost(port)
 }
 
 // parsePort reads a port number, 5432 if none is given.
@@ -437,9 +479,6 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	if err := tlsVersions(config, settings); err != nil {
 		return nil, false, err
 	}
-	if err := keyLog(config, settings["sslkeylogfile"]); err != nil {
-		return nil, false, err
-	}
 	if settings["sslsni"] == "0" {
 		config.ServerName = ""
 	}
@@ -460,19 +499,11 @@ func hostTLS(host string, settings map[string]string) (*tls.Config, bool, error)
 	if err := loadRoots(config, rootFile); err != nil {
 		return nil, false, err
 	}
-	verifies := !config.InsecureSkipVerify
-	if verifies && mode != "verify-full" {
-		verifyChainOnly(config)
+	if err := verification(config, mode, settings); err != nil {
+		return nil, false, err
 	}
-	if verifies {
-		if err := addRevocation(config, settings["sslcrl"], settings["sslcrldir"], rootFile); err != nil {
-			return nil, false, err
-		}
-	}
-	if settings["sslcertmode"] != "disable" {
-		if err := loadClientCertificate(config, settings["sslcert"], settings["sslkey"], settings["sslpassword"]); err != nil {
-			return nil, false, err
-		}
+	if err := clientCertificate(config, settings); err != nil {
+		return nil, false, err
 	}
 	return config, fallback, nil
 }
@@ -567,10 +598,31 @@ func decryptKey(keyPEM []byte, password string) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: der}), nil
 }
 
+// verification sets how the server's certificate is checked: not at all
+// where config skips it, which reads no revocation list, as libpq does not;
+// its chain alone, short of verify-full; or chain and name. sslcrl and
+// sslcrldir are consulted in either of the last two.
+func verification(config *tls.Config, mode string, settings map[string]string) error {
+	if config.InsecureSkipVerify {
+		return nil
+	}
+	revoked, err := loadRevocations(settings["sslcrl"], settings["sslcrldir"])
+	if err != nil {
+		return err
+	}
+	switch {
+	case mode != "verify-full":
+		verifyChainOnly(config, revoked)
+	case revoked != nil:
+		config.VerifyConnection = func(state tls.ConnectionState) error { return revoked.check(state.VerifiedChains) }
+	}
+	return nil
+}
+
 // verifyChainOnly makes a configuration check that the server's certificate
 // descends from a trusted root without checking the name on it: libpq's
 // verify-ca. crypto/tls has no such mode, so the check is done by hand.
-func verifyChainOnly(config *tls.Config) {
+func verifyChainOnly(config *tls.Config, revoked *revocations) {
 	roots := config.RootCAs
 	config.InsecureSkipVerify = true
 	config.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
@@ -589,8 +641,11 @@ func verifyChainOnly(config *tls.Config) {
 		for _, certificate := range certificates[1:] {
 			intermediates.AddCert(certificate)
 		}
-		_, err := certificates[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates})
-		return err
+		chains, err := certificates[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates})
+		if err != nil || revoked == nil {
+			return err
+		}
+		return revoked.check(chains)
 	}
 }
 

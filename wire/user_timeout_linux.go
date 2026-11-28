@@ -1,7 +1,5 @@
 // Copyright (c) 2026 Gembit Soultan Shirazi <gembit.soultan@gmail.com>. All rights reserved.
 
-//go:build linux
-
 package wire
 
 import (
@@ -9,19 +7,24 @@ import (
 	"time"
 )
 
-// tcpUserTimeout is TCP_USER_TIMEOUT, which the syscall package does not name.
-const tcpUserTimeout = 0x12
+// tcpUserTimeoutOption is TCP_USER_TIMEOUT, which package syscall does not
+// name.
+const tcpUserTimeoutOption = 0x12
 
-// userTimeout sets TCP_USER_TIMEOUT on a TCP socket before it connects: how
-// long sent data may go unacknowledged before the kernel drops the connection.
-func userTimeout(timeout time.Duration) func(network, address string, raw syscall.RawConn) error {
+// tcpUserTimeout is the dialer's Control function that sets TCP_USER_TIMEOUT
+// on a TCP socket, or nil when there is none to set.
+func tcpUserTimeout(timeout time.Duration) func(network, address string, raw syscall.RawConn) error {
+	if timeout <= 0 {
+		return nil
+	}
+	millis := int(timeout.Milliseconds())
 	return func(network, _ string, raw syscall.RawConn) error {
-		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		if network == "unix" {
 			return nil
 		}
 		var setErr error
 		err := raw.Control(func(fd uintptr) {
-			setErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeout, int(timeout.Milliseconds()))
+			setErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeoutOption, millis)
 		})
 		if err != nil {
 			return err

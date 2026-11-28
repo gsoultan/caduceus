@@ -9,8 +9,9 @@ import (
 	"net"
 )
 
-// peerUser is not to be had here: the peer credentials of a Unix socket are
-// read with SO_PEERCRED, which is Linux's.
-func peerUser(net.Conn) (string, error) {
-	return "", fmt.Errorf("%w: requirepeer is supported on Linux only", ErrRequirePeer)
+// checkPeer cannot learn who the server runs as here, so requirepeer refuses
+// every server rather than let one through unchecked, as libpq does where it
+// has no way to ask.
+func checkPeer(net.Conn, string) error {
+	return fmt.Errorf("%w: peer credentials are not available on this system", ErrRequirePeer)
 }

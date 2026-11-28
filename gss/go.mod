@@ -3,7 +3,7 @@ module github.com/gsoultan/caduceus/gss
 go 1.27.4
 
 require (
-	github.com/gsoultan/caduceus v0.1.1-0.20261127064436-db2d3195d0bd
+	github.com/gsoultan/caduceus v0.1.2-0.20261128090005-c5e79023c02b
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
 

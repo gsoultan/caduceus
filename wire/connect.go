@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"time"
 )
@@ -103,7 +104,7 @@ func dial(ctx context.Context, config *Config, version ProtocolVersion) (*Conn, 
 // plaintext would be refused the same, or worse, let through unbound.
 func fallbackWorthy(err error) bool {
 	var serverErr *Error
-	refused := errors.Is(err, ErrRequireAuth) || errors.Is(err, ErrChannelBinding)
+	refused := errors.Is(err, ErrRequireAuth) || errors.Is(err, ErrChannelBinding) || errors.Is(err, ErrSSLCertMode) || errors.Is(err, ErrRevoked) || errors.Is(err, ErrRequirePeer)
 	return !errors.As(err, &serverErr) && ctxErr(err) == nil && !refused
 }
 
@@ -120,7 +121,7 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version
 	if err != nil {
 		return nil, err
 	}
-	if err := checkPeer(config, netConn); err != nil {
+	if err := config.peer(network, netConn); err != nil {
 		_ = netConn.Close()
 		return nil, err
 	}
@@ -160,6 +161,13 @@ func connect(ctx context.Context, config *Config, tlsConfig *tls.Config, version
 }
 
 func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
+	encrypted, err := c.encryptGSS()
+	if err != nil {
+		return err
+	}
+	if encrypted {
+		tlsConfig = nil
+	}
 	if err := c.secure(ctx, tlsConfig); err != nil {
 		return err
 	}
@@ -171,7 +179,7 @@ func (c *Conn) login(ctx context.Context, tlsConfig *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	auth := authenticator{conn: c, policy: policy}
+	auth := authenticator{ctx: ctx, conn: c, policy: policy, gssEncrypted: encrypted}
 	asked := c.protocol
 	for i := range maxLoginMessages {
 		kind, body, err := c.Receive()
@@ -252,13 +260,39 @@ func (c *Conn) cancelKey(body []byte) bool {
 // secure starts TLS, if it is to be used: at once with DirectTLS, or once
 // the server has agreed to it.
 func (c *Conn) secure(ctx context.Context, tlsConfig *tls.Config) error {
-	switch {
-	case tlsConfig == nil:
+	if tlsConfig == nil {
 		return nil
-	case c.config.DirectTLS:
-		return c.directTLS(ctx, tlsConfig)
 	}
-	return c.negotiateTLS(ctx, tlsConfig)
+	tlsConfig, keyLog, err := c.keyLog(tlsConfig)
+	if err != nil {
+		return err
+	}
+	if keyLog != nil {
+		defer keyLog.Close()
+	}
+	if c.config.DirectTLS {
+		err = c.directTLS(ctx, tlsConfig)
+	} else {
+		err = c.negotiateTLS(ctx, tlsConfig)
+	}
+	return err
+}
+
+// keyLog is tlsConfig writing its session keys to SSLKeyLogFile, and the
+// file, which is closed once the handshake is over: every key TLS logs, it
+// logs during the handshake. It is opened here, for each connection, rather
+// than when the connection string is read, which opens nothing.
+func (c *Conn) keyLog(tlsConfig *tls.Config) (*tls.Config, *os.File, error) {
+	if c.config.SSLKeyLogFile == "" {
+		return tlsConfig, nil, nil
+	}
+	file, err := os.OpenFile(c.config.SSLKeyLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("caduceus/wire: opening sslkeylogfile: %w", err)
+	}
+	logged := tlsConfig.Clone()
+	logged.KeyLogWriter = file
+	return logged, file, nil
 }
 
 // directTLS starts TLS at once, with the ALPN protocol postgresql, by which
@@ -353,6 +387,7 @@ func (c *Conn) startupMessage() []byte {
 // authenticator answers the server's authentication requests, within what
 // require_auth and channel_binding allow.
 type authenticator struct {
+	ctx      context.Context
 	conn     *Conn
 	scram    *scramClient
 	gss      GSS
@@ -362,6 +397,11 @@ type authenticator struct {
 	// connection.
 	asked bool
 	bound bool
+	// oauth is an OAUTHBEARER exchange begun.
+	oauth bool
+	// gssEncrypted is a connection encrypted with GSSAPI, whose context
+	// the server takes as the login: it asks for nothing, and that is gss.
+	gssEncrypted bool
 }
 
 // requireBinding reports whether channel_binding is require.
@@ -392,7 +432,7 @@ func (a *authenticator) method(method string) error {
 // asked for nothing must be allowed to, and a binding required was made.
 func (a *authenticator) authenticated() error {
 	if !a.asked {
-		if err := a.policy.check("none"); err != nil {
+		if err := a.policy.check(a.silentMethod()); err != nil {
 			return err
 		}
 	}
@@ -400,6 +440,15 @@ func (a *authenticator) authenticated() error {
 		return ErrChannelBinding
 	}
 	return nil
+}
+
+// silentMethod is what a login that asked for nothing was: gss, over a
+// connection whose GSSAPI encryption authenticated it, and none otherwise.
+func (a *authenticator) silentMethod() string {
+	if a.gssEncrypted {
+		return "gss"
+	}
+	return "none"
 }
 
 func (a *authenticator) handle(body []byte) error {
@@ -424,11 +473,7 @@ func (a *authenticator) handle(body []byte) error {
 		}
 		return a.send(AppendString(nil, md5Response(a.conn.config.User, a.conn.config.Password, data)))
 	case authSASL:
-		a.asked = true
-		if err := a.policy.check("scram-sha-256"); err != nil {
-			return err
-		}
-		return a.beginSCRAM(data)
+		return a.beginSASL(data)
 	case authGSS:
 		return a.beginGSS("gss")
 	case authSSPI:
@@ -436,7 +481,7 @@ func (a *authenticator) handle(body []byte) error {
 	case authGSSContinue:
 		return a.continueGSS(data)
 	case authSASLContinue:
-		return a.continueSCRAM(data)
+		return a.continueSASL(data)
 	case authSASLFinal:
 		return a.finishSCRAM(data)
 	}
@@ -457,6 +502,27 @@ func (a *authenticator) send(body []byte) error {
 	message, mark := StartMessage(nil, 'p')
 	_, err := a.conn.netConn.Write(FinishMessage(append(message, body...), mark))
 	return err
+}
+
+// beginSASL begins SCRAM where the server offers it, and OAUTHBEARER where
+// that is all it offers.
+func (a *authenticator) beginSASL(mechanisms []byte) error {
+	if !offersSCRAM(mechanisms) && offersMechanism(mechanisms, oauthMechanism) {
+		return a.beginOAuth()
+	}
+	a.asked = true
+	if err := a.policy.check("scram-sha-256"); err != nil {
+		return err
+	}
+	return a.beginSCRAM(mechanisms)
+}
+
+// continueSASL is the server's next step in whichever exchange is begun.
+func (a *authenticator) continueSASL(data []byte) error {
+	if a.oauth {
+		return a.refusedOAuth(data)
+	}
+	return a.continueSCRAM(data)
 }
 
 // beginSCRAM begins SCRAM with the mechanism scramMechanisms picks.

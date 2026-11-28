@@ -166,11 +166,11 @@ func TestKerberosLoginRefused(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ParseConfig("host=db user=u gssencmode=require"); !errors.Is(err, ErrInvalidConnString) {
-		t.Errorf("gssencmode=require = %v, want ErrInvalidConnString", err)
+	if _, err := ParseConfig("host=db user=u gssencmode=always"); !errors.Is(err, ErrInvalidConnString) {
+		t.Errorf("gssencmode=always = %v, want ErrInvalidConnString", err)
 	}
 	config, err := ParseConfig("host=db user=u gssencmode=prefer krbsrvname=pg gsslib=gssapi")
-	if err != nil || config.KerberosServiceName != "pg" || config.RuntimeParams["gssencmode"] != "" || config.RuntimeParams["gsslib"] != "" {
+	if err != nil || config.KerberosServiceName != "pg" || config.GSSEncMode != "prefer" || config.RuntimeParams["gssencmode"] != "" || config.RuntimeParams["gsslib"] != "" {
 		t.Errorf("config = %+v, %v", config, err)
 	}
 }

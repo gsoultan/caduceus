@@ -28,11 +28,9 @@ const scramNonceLen = 18
 
 // scramClient is the client half of SCRAM-SHA-256.
 //
-// The password is used as given. PostgreSQL passes one through SASLprep and
-// falls back to the raw bytes where that fails; for a password of printable
-// ASCII the two are the same, and that is the case this covers. A password
-// SASLprep would rewrite, such as one with full-width characters, will not
-// authenticate.
+// The password is passed through SASLprep as PostgreSQL passes it when it is
+// set (see saslprep), so that one SASLprep rewrites, such as one with
+// full-width characters or a decomposed accent, authenticates.
 type scramClient struct {
 	password string
 	// header is the GS2 header: n,, for no channel binding, y,, for a client
@@ -81,7 +79,7 @@ func (c *scramClient) final(serverFirst []byte) ([]byte, error) {
 		return nil, ErrSCRAM
 	}
 
-	salted, err := pbkdf2.Key(sha256.New, c.password, salt, iterations, sha256.Size)
+	salted, err := pbkdf2.Key(sha256.New, saslprep(c.password), salt, iterations, sha256.Size)
 	if err != nil {
 		return nil, err
 	}

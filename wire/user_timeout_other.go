@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// userTimeout does nothing: TCP_USER_TIMEOUT is Linux's alone, and libpq
-// ignores tcp_user_timeout where it is not to be had, as this does.
-func userTimeout(time.Duration) func(network, address string, raw syscall.RawConn) error {
+// tcpUserTimeout sets nothing where TCP_USER_TIMEOUT is not to be had; libpq
+// ignores tcp_user_timeout there too.
+func tcpUserTimeout(time.Duration) func(network, address string, raw syscall.RawConn) error {
 	return nil
 }

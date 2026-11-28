@@ -158,7 +158,7 @@ func selfSigned(t *testing.T, dir, password string) (string, string, tls.Certifi
 // wrong one, the key is refused without saying what it was.
 func TestParseSSLPassword(t *testing.T) {
 	certFile, keyFile, _ := selfSigned(t, t.TempDir(), "key secret")
-	base := "host=a user=u sslmode=require sslcert=" + certFile + " sslkey=" + keyFile
+	base := "host=a user=u sslmode=require sslcert=" + conninfo(certFile) + " sslkey=" + conninfo(keyFile)
 	config, err := ParseConfig(base + " sslpassword='key secret'")
 	if err != nil || len(config.TLSConfig.Certificates) != 1 {
 		t.Fatalf("with sslpassword: %v", err)

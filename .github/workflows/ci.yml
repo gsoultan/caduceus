@@ -39,12 +39,55 @@ jobs:
           fi
       - run: go test -race -count=1 ./... && (cd gss && go test -race -count=1 ./...)
 
+  # Linux is where the live tests run; these build and run the unit tests
+  # where the kernel differs, for the code with a file per system: the read
+  # watermark, peeking at the socket, peer credentials and TCP_USER_TIMEOUT.
+  systems:
+    name: Unit tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
+  # Every parser that reads what comes off the network, and the connection
+  # string, fuzzed for a short while on each change. A finding is saved under
+  # testdata/fuzz, which the unit tests then replay.
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - ./codec FuzzScan
+          - ./codec FuzzParseDecimalFast
+          - ./replication FuzzDecode
+          - ./wire FuzzParseBackendMessages
+          - ./wire FuzzParseConfig
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Fuzz for a minute
+        run: |
+          set -- ${{ matrix.target }}
+          go test -run='^$' -fuzz="^$2\$" -fuzztime=60s "$1"
+
   live:
     name: Against PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        postgres: ['14', '17']
+        postgres: ['14', '17', '18']
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine

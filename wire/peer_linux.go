@@ -1,36 +1,39 @@
 // Copyright (c) 2026 Gembit Soultan Shirazi <gembit.soultan@gmail.com>. All rights reserved.
 
-//go:build linux
-
 package wire
 
 import (
+	"fmt"
 	"net"
 	"os/user"
 	"strconv"
 	"syscall"
 )
 
-// peerUser is the name of the user the process at the other end of a Unix
-// socket runs as, from its peer credentials.
-func peerUser(conn net.Conn) (string, error) {
+// checkPeer refuses a server on a Unix socket whose process does not run as
+// want, which the kernel reports as the socket's peer credentials.
+func checkPeer(conn net.Conn, want string) error {
 	raw := rawSocket(conn)
 	if raw == nil {
-		return "", ErrRequirePeer
+		return fmt.Errorf("%w: the connection is no socket", ErrRequirePeer)
 	}
-	var cred *syscall.Ucred
+	var credentials *syscall.Ucred
 	var credErr error
-	if err := raw.Control(func(fd uintptr) {
-		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); err != nil {
-		return "", err
+	err := raw.Control(func(fd uintptr) {
+		credentials, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	})
+	if err == nil {
+		err = credErr
 	}
-	if credErr != nil {
-		return "", credErr
-	}
-	found, err := user.LookupId(strconv.FormatUint(uint64(cred.Uid), 10))
 	if err != nil {
-		return "", err
+		return fmt.Errorf("%w: %w", ErrRequirePeer, err)
 	}
-	return found.Username, nil
+	peer, err := user.LookupId(strconv.FormatUint(uint64(credentials.Uid), 10))
+	if err != nil {
+		return fmt.Errorf("%w: user %d: %w", ErrRequirePeer, credentials.Uid, err)
+	}
+	if peer.Username != want {
+		return fmt.Errorf("%w: requirepeer is %q and the server runs as %q", ErrRequirePeer, want, peer.Username)
+	}
+	return nil
 }

@@ -2,7 +2,10 @@
 
 package wire
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Every backend message body reaches one of these parsers straight off the
 // network. Whatever the server, or something pretending to be one, sends, the
@@ -22,5 +25,31 @@ func FuzzParseBackendMessages(f *testing.F) {
 		_, _ = SplitDataRow(nil, body)
 		_ = ParseError(body).Error()
 		_, _ = parseNotification(body)
+	})
+}
+
+// FuzzParseConfig checks that no connection string panics ParseConfig, and
+// that an error never repeats the password. The password comes first, in
+// key=value form and in a URL, so that what the fuzzer adds after it cannot
+// make it some other setting's value, which an error may well repeat.
+func FuzzParseConfig(f *testing.F) {
+	for _, seed := range []string{
+		"host=a,b port=1,2 hostaddr=10.0.0.1,::1 user=u",
+		"a:1,b:2/db?sslmode=verify-full&keepalives_idle=x",
+		"host=a keepalives=2 tcp_user_timeout=-1 load_balance_hosts=x",
+		"host=a sslmode=require ssl_min_protocol_version=TLSv1.3 ssl_max_protocol_version=TLSv1",
+		"host=a sslcertmode=nope hostaddr=,, gssencmode=x oauth_scope='a b'",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, text string) {
+		if strings.Contains(text, "sekrit") {
+			return
+		}
+		for _, full := range []string{"password=sekrit " + text, "postgres://u:sekrit@" + text} {
+			if _, err := ParseConfig(full); err != nil && strings.Contains(err.Error(), "sekrit") {
+				t.Fatalf("ParseConfig(%q): the error repeats the password: %v", full, err)
+			}
+		}
 	})
 }

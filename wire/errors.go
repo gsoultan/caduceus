@@ -34,6 +34,10 @@ var (
 	// connection whose Config.NewGSS is nil.
 	ErrNoGSS = errors.New("caduceus/wire: the server asked for Kerberos (GSSAPI) and Config.NewGSS is nil: set it, to gss.New from github.com/gsoultan/caduceus/gss for one")
 
+	// ErrOAuth is a login with OAuth (OAUTHBEARER, PostgreSQL 18) that
+	// failed on the client's side, or whose token the server refused.
+	ErrOAuth = errors.New("caduceus/wire: OAuth login failed")
+
 	// ErrSCRAM is returned when the server does not hold up its half of
 	// SCRAM-SHA-256. It says no more than that: the detail would be about a secret.
 	ErrSCRAM = errors.New("caduceus/wire: server failed SCRAM authentication")
@@ -59,20 +63,20 @@ var (
 	// SCRAM. Nothing of the password has been sent.
 	ErrChannelBinding = errors.New("caduceus/wire: channel binding is required and not to be had")
 
-	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
-	// string, because the string is where the password is.
-	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")
-
-	// ErrRequirePeer is returned when the process at the other end of a Unix
-	// socket is not running as the user requirepeer names, or its user
-	// cannot be learned on this system.
-	ErrRequirePeer = errors.New("caduceus/wire: the server is not running as the user requirepeer names")
+	// ErrRequirePeer is returned when requirepeer names a user and the server
+	// at the other end of the Unix socket runs as another, or the system
+	// cannot say who it runs as.
+	ErrRequirePeer = errors.New("caduceus/wire: the server's process does not run as the user requirepeer names")
 
 	// ErrSSLCertMode is returned when sslcertmode=require and the server did
 	// not ask for a client certificate.
 	ErrSSLCertMode = errors.New("caduceus/wire: sslcertmode=require and the server did not ask for a client certificate")
 
-	// ErrRevoked is returned when a certificate the server presents is listed
-	// in a revocation list sslcrl or sslcrldir names.
-	ErrRevoked = errors.New("caduceus/wire: the server's certificate is revoked")
+	// ErrRevoked is returned when a certificate the server presents is on a
+	// revocation list sslcrl or sslcrldir names.
+	ErrRevoked = errors.New("caduceus/wire: the server's certificate has been revoked")
+
+	// ErrInvalidConnString is returned by ParseConfig. It never quotes the
+	// string, because the string is where the password is.
+	ErrInvalidConnString = errors.New("caduceus/wire: invalid connection string")
 )

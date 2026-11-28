@@ -16,7 +16,7 @@ type authPolicy struct {
 
 // authMethods are the names require_auth knows, as libpq names them.
 var authMethods = map[string]bool{
-	"password": true, "md5": true, "scram-sha-256": true, "gss": true, "sspi": true, "none": true,
+	"password": true, "md5": true, "scram-sha-256": true, "gss": true, "sspi": true, "oauth": true, "none": true,
 }
 
 // parseRequireAuth reads require_auth: a comma-separated list of methods,
@@ -32,7 +32,7 @@ func parseRequireAuth(text string) (authPolicy, error) {
 		case negated != policy.negated:
 			return authPolicy{}, fmt.Errorf("%w: require_auth mixes methods with and without !", ErrInvalidConnString)
 		case !authMethods[method]:
-			return authPolicy{}, fmt.Errorf("%w: require_auth method %q is not one of password, md5, scram-sha-256, gss, sspi, none", ErrInvalidConnString, method)
+			return authPolicy{}, fmt.Errorf("%w: require_auth method %q is not one of password, md5, scram-sha-256, gss, sspi, oauth, none", ErrInvalidConnString, method)
 		case policy.methods[method]:
 			return authPolicy{}, fmt.Errorf("%w: require_auth names %q twice", ErrInvalidConnString, method)
 		}

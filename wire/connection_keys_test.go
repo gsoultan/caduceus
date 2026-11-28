@@ -17,8 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
@@ -57,7 +55,7 @@ func TestParseLibpqConnectionKeywords(t *testing.T) {
 		"keepalives=2", "keepalives_idle=x", "keepalives_count=-1", "tcp_user_timeout=soon", "load_balance_hosts=yes",
 		"sslcertmode=maybe", "sslmode=require ssl_min_protocol_version=SSLv3",
 		"sslmode=require ssl_min_protocol_version=TLSv1.3 ssl_max_protocol_version=TLSv1.2",
-		"oauth_issuer=https://issuer", "scram_client_key=x",
+		"scram_client_key=x",
 	} {
 		if _, err := ParseConfig("host=a user=u " + bad); !errors.Is(err, ErrInvalidConnString) {
 			t.Errorf("%s: err = %v, want ErrInvalidConnString", bad, err)
@@ -79,73 +77,6 @@ func TestNetDialer(t *testing.T) {
 	}
 	if d := (&Config{TCPUserTimeout: time.Second}).netDialer(); runtime.GOOS == "linux" && d.Control == nil {
 		t.Error("tcp_user_timeout set nothing on the socket")
-	}
-}
-
-// load_balance_hosts=random tries every server, in an order that changes.
-func TestLoadBalanceHosts(t *testing.T) {
-	config, err := ParseConfig("host=h0,h1,h2,h3,h4,h5,h6,h7 user=u load_balance_hosts=random")
-	if err != nil {
-		t.Fatal(err)
-	}
-	orders := map[string]bool{}
-	for range 20 {
-		var names []string
-		for _, server := range config.servers() {
-			names = append(names, server.Host)
-		}
-		if len(names) != 8 {
-			t.Fatalf("servers = %v", names)
-		}
-		orders[strings.Join(names, ",")] = true
-	}
-	if len(orders) < 2 {
-		t.Error("twenty shuffles of eight hosts all came out the same")
-	}
-	config.LoadBalanceHosts = false
-	if first := config.servers()[0].Host; first != "h0" {
-		t.Errorf("without load balancing the first server is %s", first)
-	}
-}
-
-// requirepeer checks who runs the server at the other end of a Unix socket.
-func TestLiveRequirePeer(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("requirepeer is checked on Linux only")
-	}
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DATABASE_URL unset")
-	}
-	const dir = "/var/run/postgresql"
-	tcp, err := ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The server must be on this machine, listening on the socket: in CI it
-	// runs in a container, and the directory can exist without it.
-	socket := dir + "/.s.PGSQL." + strconv.Itoa(int(tcp.Port))
-	if _, err := os.Stat(socket); err != nil {
-		t.Skip("no Unix socket at " + socket)
-	}
-	for _, tc := range []struct {
-		peer string
-		ok   bool
-	}{{"postgres", true}, {"nobody", false}} {
-		config := tcp.Copy()
-		config.Host, config.TLSConfig, config.Fallbacks, config.RequirePeer = dir, nil, nil, tc.peer
-		conn, err := Connect(context.Background(), config)
-		switch {
-		// The check passed if the server was reached, whatever it then said
-		// of the login.
-		case tc.ok && errors.Is(err, ErrRequirePeer):
-			t.Errorf("requirepeer=%s: %v", tc.peer, err)
-		case !tc.ok && !errors.Is(err, ErrRequirePeer):
-			t.Errorf("requirepeer=%s: err = %v, want ErrRequirePeer", tc.peer, err)
-		}
-		if conn != nil {
-			_ = conn.Close(context.Background())
-		}
 	}
 }
 
@@ -198,10 +129,10 @@ func newPKI(t *testing.T) pki {
 	return p
 }
 
-// tlsServer accepts one TLS connection per test, after answering an
+// refusingTLSServer accepts one TLS connection per test, after answering an
 // SSLRequest with S, and refuses the login it then reads: reaching that
 // refusal is how a test knows the handshake was accepted.
-func tlsServer(t *testing.T, config *tls.Config) (string, string) {
+func refusingTLSServer(t *testing.T, config *tls.Config) (string, string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -247,16 +178,16 @@ func accepted(err error) bool {
 // a connection that verifies the certificate consults it, as in libpq.
 func TestRevocationList(t *testing.T) {
 	p := newPKI(t)
-	host, port := tlsServer(t, &tls.Config{Certificates: []tls.Certificate{p.server}})
-	base := "host=" + host + " port=" + port + " user=u connect_timeout=5 sslsni=0 sslrootcert=" + p.root
+	host, port := refusingTLSServer(t, &tls.Config{Certificates: []tls.Certificate{p.server}})
+	base := "host=" + host + " port=" + port + " user=u connect_timeout=5 sslsni=0 sslrootcert=" + conninfo(p.root)
 	for _, tc := range []struct {
 		settings string
 		revoked  bool
 	}{
 		{" sslmode=verify-ca", false},
-		{" sslmode=verify-ca sslcrl=" + p.crl, true},
-		{" sslmode=verify-ca sslcrldir=" + filepath.Dir(p.crl), true},
-		{" sslmode=require sslrootcert='' sslcrl=" + p.crl, false},
+		{" sslmode=verify-ca sslcrl=" + conninfo(p.crl), true},
+		{" sslmode=verify-ca sslcrldir=" + conninfo(filepath.Dir(p.crl)), true},
+		{" sslmode=require sslrootcert='' sslcrl=" + conninfo(p.crl), false},
 	} {
 		config, err := ParseConfig(base + tc.settings)
 		if err != nil {
@@ -270,7 +201,7 @@ func TestRevocationList(t *testing.T) {
 			t.Errorf("%s: err = %v, want the handshake accepted", tc.settings, err)
 		}
 	}
-	if _, err := ParseConfig(base + " sslmode=verify-ca sslcrl=" + p.root); !errors.Is(err, ErrInvalidConnString) {
+	if _, err := ParseConfig(base + " sslmode=verify-ca sslcrl=" + conninfo(p.root)); !errors.Is(err, ErrInvalidConnString) {
 		t.Errorf("a file with no list in it: err = %v", err)
 	}
 }
@@ -282,7 +213,7 @@ func TestSSLCertModeRequire(t *testing.T) {
 		auth tls.ClientAuthType
 		ok   bool
 	}{{tls.NoClientCert, false}, {tls.RequestClientCert, true}} {
-		host, port := tlsServer(t, &tls.Config{Certificates: []tls.Certificate{p.server}, ClientAuth: tc.auth})
+		host, port := refusingTLSServer(t, &tls.Config{Certificates: []tls.Certificate{p.server}, ClientAuth: tc.auth})
 		config, err := ParseConfig("host=" + host + " port=" + port + " user=u connect_timeout=5 sslmode=require sslcertmode=require")
 		if err != nil {
 			t.Fatal(err)

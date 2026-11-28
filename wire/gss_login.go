@@ -32,15 +32,19 @@ func (a *authenticator) beginGSS(method string) error {
 
 // initToken asks for the first token, for KerberosSPN or for service/host.
 func (a *authenticator) initToken() ([]byte, error) {
-	config := a.conn.config
+	return gssInitToken(a.conn.config, a.gss)
+}
+
+// gssInitToken asks gss for the first token of a context with the server.
+func gssInitToken(config *Config, gss GSS) ([]byte, error) {
 	if config.KerberosSPN != "" {
-		return a.gss.GetInitTokenFromSPN(config.KerberosSPN)
+		return gss.GetInitTokenFromSPN(config.KerberosSPN)
 	}
 	service := config.KerberosServiceName
 	if service == "" {
 		service = defaultKerberosService
 	}
-	return a.gss.GetInitToken(kerberosHost(config.Host), service)
+	return gss.GetInitToken(kerberosHost(config.Host), service)
 }
 
 // kerberosHost is the host part of the server's principal. A Unix socket has
