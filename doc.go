@@ -22,8 +22,8 @@
 //	}
 //	return tx.Commit(ctx)
 //
-// A Conn is one connection and belongs to one goroutine at a time. Pool
-// connections with gpool (github.com/gsoultan/gpool), which is built on caduceus.
+// A Conn is one connection and belongs to one goroutine at a time. A Pool is
+// safe for concurrent use, and hands back the same Rows, Row and Tx.
 //
 // The subpackages are usable alone: wire speaks the protocol, codec converts
 // between Go values and PostgreSQL's formats, and replication decodes logical

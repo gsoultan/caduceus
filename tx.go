@@ -58,6 +58,9 @@ type Tx struct {
 	savepoint string
 	depth     int
 	done      bool
+	// release gives a pool's connection back once the transaction is
+	// settled. Only a transaction a Pool began has one.
+	release func()
 }
 
 // Begin starts a transaction with the server's default characteristics.
@@ -184,6 +187,20 @@ func (t *Tx) Begin(ctx context.Context) (*Tx, error) {
 // transaction had already failed, the server rolls it back instead and Commit
 // returns ErrTxCommitRollback.
 func (t *Tx) Commit(ctx context.Context) error {
+	err := t.commit(ctx)
+	t.released()
+	return err
+}
+
+// released gives a pool's connection back, once the transaction is settled.
+func (t *Tx) released() {
+	if release := t.release; release != nil && t.done {
+		t.release = nil
+		release()
+	}
+}
+
+func (t *Tx) commit(ctx context.Context) error {
 	if t.spent() {
 		return ErrTxClosed
 	}
@@ -219,6 +236,12 @@ func (t *Tx) Commit(ctx context.Context) error {
 // Rollback rolls the transaction back, or back to the savepoint. Called after
 // Commit it returns ErrTxClosed, which a deferred Rollback can ignore.
 func (t *Tx) Rollback(ctx context.Context) error {
+	err := t.rollback(ctx)
+	t.released()
+	return err
+}
+
+func (t *Tx) rollback(ctx context.Context) error {
 	if t.spent() {
 		return ErrTxClosed
 	}

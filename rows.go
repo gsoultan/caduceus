@@ -44,6 +44,11 @@ type Rows struct {
 	// inline holds the values of a narrow row, saving their slice an
 	// allocation of its own.
 	inline [6][]byte
+
+	// release gives a pool's connection back once the exchange is settled.
+	// Only rows a Pool opened have one, and it is the last thing settle does:
+	// nothing of the connection is touched after it.
+	release func()
 }
 
 func (c *Rows) init(s *Conn, stmt *statement, inBatch bool) {
@@ -184,6 +189,10 @@ func (c *Rows) settle(err error) {
 		c.err = finished
 	}
 	c.session.traceRowsEnd(c)
+	if release := c.release; release != nil {
+		c.release = nil
+		release()
+	}
 }
 
 // fail ends the exchange on an error of the connection. What is kept is what

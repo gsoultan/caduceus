@@ -111,6 +111,22 @@ type Config struct {
 	// has no earlier deadline. Zero means only the context bounds it.
 	ConnectTimeout time.Duration
 
+	// CancelDelay, when positive, keeps a connection whose context ends in the
+	// middle of an exchange. A CancelRequest is sent at once, and the
+	// exchange goes on reading the server's answer, usually an error with
+	// SQLSTATE 57014, for up to CancelDelay; the connection is closed only if
+	// that runs out. It is for a session a person drives, such as a SQL
+	// console, where cancelling a long statement must not end the session
+	// and lose its transaction, temporary tables and settings. Zero, the
+	// default, sends the CancelRequest and closes the connection at once, so a
+	// caller past its deadline never waits on the server.
+	//
+	// The cancel can arrive after the statement it was meant for has
+	// finished, as every CancelRequest can: the server then cancels whatever
+	// the connection is running when it arrives, which is nothing between
+	// exchanges, but can be the next statement if one is sent at once.
+	CancelDelay time.Duration
+
 	// MaxMessageSize bounds a single message from the server. Zero means
 	// DefaultMaxMessageSize.
 	MaxMessageSize int
