@@ -593,3 +593,12 @@ func verifyChainOnly(config *tls.Config) {
 		return err
 	}
 }
+
+// Settings returns the settings a connection string spells out, a URL's or
+// key=value pairs, as written: nothing is read from the environment, the
+// password file or a service file, and nothing is checked. It is for a caller
+// that reads settings of its own from the string, as Pool reads pool_max_conns
+// and the like, which ParseConfig drops.
+func Settings(connString string) (map[string]string, error) {
+	return parseSettings(connString)
+}

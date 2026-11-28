@@ -21,6 +21,9 @@ type Guard struct {
 	ctx      context.Context
 	stop     func() bool
 	deadline bool
+	// keep is Config.CancelDelay in force: a context that ends cancels the
+	// statement and lets the exchange read on, rather than closing.
+	keep bool
 }
 
 // Watch starts guarding an exchange with ctx. If ctx ends while a read or write
@@ -29,6 +32,21 @@ func (c *Conn) Watch(ctx context.Context) Guard {
 	g := Guard{conn: c, ctx: ctx}
 	c.overdue.Store(false)
 	c.wrote = false
+	if delay := c.config.CancelDelay; delay > 0 && ctx.Done() != nil {
+		// The context's deadline is not put on the socket: the exchange
+		// outlives it by up to delay, reading the server's answer to the
+		// cancel. The socket's deadline is set when the context ends.
+		g.keep = true
+		g.stop = context.AfterFunc(ctx, func() {
+			_ = c.netConn.SetDeadline(time.Now().Add(delay))
+			go func() {
+				cctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
+				defer cancel()
+				_ = c.CancelRequest(cctx)
+			}()
+		})
+		return g
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetDeadline(deadline)
 		g.deadline = true
@@ -69,6 +87,17 @@ func (g Guard) Done(err error) error {
 // done is Done without marking the error.
 func (g Guard) done(err error) error {
 	fired := g.stop != nil && !g.stop()
+	if g.keep && fired && !g.conn.overdue.Load() {
+		// The server answered the cancel within CancelDelay, so the stream is
+		// at a boundary and the connection is kept.
+		if !g.conn.closed.Load() {
+			_ = g.conn.netConn.SetDeadline(time.Time{})
+		}
+		if err == nil {
+			return nil
+		}
+		return fmt.Errorf("caduceus: %w (%w)", context.Cause(g.ctx), err)
+	}
 	if !fired && !g.conn.overdue.Load() {
 		if g.deadline && !g.conn.closed.Load() {
 			_ = g.conn.netConn.SetDeadline(time.Time{})

@@ -33,7 +33,8 @@ err = conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 42).Scan(&name)
 | **LISTEN/NOTIFY** | `WaitForNotification`, which never aborts a connection on timeout, or `wire.Config.OnNotification` to have each one handed over as it arrives. `wire.Config.OnNotice` gets the server's notices, such as `RAISE NOTICE` |
 | **Tracing** | `Options.Tracer` takes a `QueryTracer`, told when each statement starts and ends, with the SQL, a copy of its arguments, the command tag and the error; a query ends when its rows do. A tracer that is also a `BatchTracer`, `CopyFromTracer`, `PrepareTracer` or `ConnectTracer` is told of those too, as in pgx. The context a start returns is the one the statement runs in, so a span carries through. Without a tracer it costs nothing: `QueryRow` stays at one allocation |
 | **Health** | `Ping` makes a round trip; `CheckConn` makes none and waits for nothing, and finds a server that hung up or ended the session (FATAL 57P01, a shutdown) by looking at the socket, closing the connection if so |
-| **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection; one already over before the query is sent sends nothing and leaves the connection open |
+| **Cancellation** | a context ending mid-query sends a CancelRequest and closes the connection; one already over before the query is sent sends nothing and leaves the connection open. With `wire.Config.CancelDelay` set, the connection is kept instead: the statement fails with the server's 57014 and the session, its transaction included, goes on, as a SQL console needs |
+| **Pool** | `NewPool` / `NewPoolConfig`: a pool safe for concurrent use whose `Exec`, `Query`, `QueryRow`, `SendBatch`, `CopyFrom` and `Begin` hand back caduceus's own `*Rows`, `*Row`, `*Tx` and `*BatchResults`, so `CollectRows` and `BeginFunc` take a `*Pool` as they take a `*Conn`. `MaxConns`, `MinConns`, `MaxConnLifetime`, `MaxConnIdleTime`, `HealthCheckPeriod`, `AfterConnect` and `ResetQuery`, named as nextar names them; `pool_max_conns` and pgxpool's other URL settings are read. `Acquire` lends one connection until `Release`; `Stat` reports what pgxpool's did |
 | **Prepared statements** | `Prepare` and `Tx.Prepare` return a `StatementDescription` (parameter OIDs, result fields); every way of running a statement runs a prepared one given its name, with no Parse; `Deallocate`, `DeallocateAll`. Kept apart from the statement cache, which never evicts them, and on the server whatever the options |
 | **Statement cache** | LRU of server-side prepared statements, 64 by default. Off, for a pooler in transaction mode, nothing is kept on the server and a statement the connection has run before is still one round trip |
 | **Types** | integers, floats, numeric (into `*big.Rat`, `*big.Float`, a float or a string, and from `*big.Rat` as its exact decimal), bool, text, bytea, uuid, date/time/timestamp/timestamptz/interval, json/jsonb, enums and domains as their text; `inet`/`cidr` into `netip.Addr`, `netip.Prefix`, `net.IP` or `net.IPNet`, `macaddr` into `net.HardwareAddr`; arrays of every type, as slices, nested for more dimensions; `codec.Range[T]` and `codec.Multirange[T]` for the range types and your own; `codec.Hstore`; `codec.Bits` for bit and varbit; `codec.Point`, `Box`, `Lseg`, `Line`, `Circle`, `Path`, `Polygon`; `codec.CompositeFields` for a record or a composite type's row, in and out; `codec.Scanner` and `codec.Valuer` for your own types, and `codec.BinaryParam` for one that writes its own binary form; a pointer destination receives NULL |
@@ -351,9 +352,47 @@ which has no such statement or, worse, another client's of the same name.
 A `Conn` is one connection and belongs to one goroutine at a time; it has no
 lock, because the protocol is a strict request/response sequence. A result not
 read to its end keeps the connection busy, and the next call returns
-`ErrConnBusy` rather than interleaving with it. For many goroutines, pool
-connections with [gpool](https://github.com/gsoultan/gpool), which is built on
-caduceus.
+`ErrConnBusy` rather than interleaving with it. For many goroutines, use a
+`Pool`:
+
+```go
+pool, err := caduceus.NewPool(ctx, "postgres://app:secret@db:5432/app?pool_max_conns=20")
+if err != nil {
+	return err
+}
+defer pool.Close()
+
+rows, err := pool.Query(ctx, "SELECT id, user_name, email FROM users")
+if err != nil {
+	return err
+}
+users, err := caduceus.CollectRows(rows, caduceus.RowToStructByName[User])
+
+err = caduceus.BeginFunc(ctx, pool, func(tx *caduceus.Tx) error {
+	_, err := tx.Exec(ctx, "UPDATE users SET seen_at = now() WHERE id = $1", 42)
+	return err
+})
+```
+
+Each call takes a connection and gives it back when its result is done with:
+`Exec` at once, rows once read to the end or closed, a row once scanned, a
+batch once closed, a transaction once settled. A connection given back with a
+transaction open is rolled back, and one in the middle of a result, closed,
+past `MaxConnLifetime` or whose `ResetQuery` failed is closed instead of kept.
+One idle for more than a second is checked with `CheckConn` as it is handed
+out, which costs no round trip. No more than `MaxConns` are ever open.
+
+The pool is for one program. To bound connections across many, put a pooler
+in front of the server: nextar's
+[gpoolproxy](https://github.com/gsoultan/nextar/tree/main/examples/gpoolproxy),
+or PgBouncer, in transaction mode. Both follow prepared statements from one
+server connection to the next, so the default statement cache works through
+them, as `TestLivePoolThroughPooler` checks with twelve pool connections on
+three server connections; a pooler that does not needs
+`Options.StatementCacheCapacity: -1`. A `SET` outside a transaction does not
+survive such a pooler; use `SET LOCAL` inside one. For a pool across
+databases other than PostgreSQL, or for change data capture, use
+[nextar](https://github.com/gsoultan/nextar), which is built on caduceus.
 
 ## Performance
 
@@ -484,8 +523,9 @@ DATABASE_URL='postgres://…' go test -race ./...       # adds the live tests
 ```
 
 Two more variables add tests that need more than one server. `POOLER_URL`
-names a pooler in transaction mode in front of the same server, for the tests
-of what such a pooler does to a statement. `STANDBY_URL` names a hot standby,
+names a pooler in transaction mode in front of the same server, such as
+nextar's gpoolproxy, for the tests of what such a pooler does to a statement
+and to a `Pool`. `STANDBY_URL` names a hot standby,
 which is the one place a server refuses a `BEGIN`, and which with
 `DATABASE_URL` tests `target_session_attrs`. `DATABASE_URL_SCRAM`,
 `DATABASE_URL_MD5` and `DATABASE_URL_PLAIN` name roles that log in with
